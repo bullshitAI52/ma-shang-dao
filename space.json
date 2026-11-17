@@ -1,0 +1,8 @@
+{
+  "entry": "client/dist/index.html",
+  "managedCronJobs": [],
+  "name": "马上到",
+  "platformVersion": 28,
+  "runtime": "typescript",
+  "slug": "sha-men-gong-jiao"
+}
