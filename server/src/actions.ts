@@ -2863,9 +2863,103 @@ export const Actions = {
     },
   }),
 
+  repairCanvasTree: defineAction({
+    description:
+      "一次性理顺某城市画布的路线树挂接（幂等，可重复调用、已理顺时什么都不改）：路线树迁移按步号推导 parent 时，有同一步的卡只挂上了一部分——如「上班」里青浦路口·103路已挂到长虹路·33路名下、同一步的青浦路口·24路却留在顶层，纵向流画成 103 在前、24 在后的先后关系，其实两卡是同层并列的备选路线（中间应是「或」）。理顺规则（按项目逐个看）：把模块按 stepIndex 分组，若某一步的上一组恰好只有一张卡 P、且本组已至少有一张卡挂在 P 名下（说明本组本就属于 P 的分支），则把本组里还留在顶层（parent 为空）的卡一并挂到 P 名下；本组没有任何卡挂在 P 名下、或上一组不止一张卡时不动（不凭空造结构、不覆盖用户自己挂到别处的关系）。只改 parent_id，模块内容、步号、启停、连线一律不动。返回实际执行的动作与理顺后全部模块的挂接清单。city 缺省为厦门。",
+    request: z.object({
+      city: z.string().max(20).optional(),
+    }),
+    response: z.object({
+      changed: z.boolean(),
+      actions: z.array(z.string()),
+      modules: z.array(
+        z.object({
+          id: z.number(),
+          projectId: z.number(),
+          label: z.string(),
+          parentId: z.number(),
+        }),
+      ),
+    }),
+    async handler(ctx, args) {
+      const city = cityOf(args.city);
+      const db = ctx.db<typeof schema>();
+      const done: string[] = [];
+      const labelOf = (m: typeof schema.canvasModules.$inferSelect) =>
+        m.kind === "station"
+          ? `${m.station || "（未填站名）"} · ${m.line || "（未填线路）"}`
+          : m.text || "（文本卡）";
+      const rows = await db
+        .select()
+        .from(schema.canvasModules)
+        .where(eq(schema.canvasModules.city, city))
+        .orderBy(schema.canvasModules.id)
+        .limit(2000);
+      const byProject = new Map<
+        number,
+        (typeof schema.canvasModules.$inferSelect)[]
+      >();
+      for (const r of rows) {
+        const arr = byProject.get(r.projectId) ?? [];
+        arr.push(r);
+        byProject.set(r.projectId, arr);
+      }
+      for (const mods of byProject.values()) {
+        const byStep = new Map<
+          number,
+          (typeof schema.canvasModules.$inferSelect)[]
+        >();
+        for (const m of mods) {
+          if (m.stepIndex <= 0) continue;
+          const arr = byStep.get(m.stepIndex) ?? [];
+          arr.push(m);
+          byStep.set(m.stepIndex, arr);
+        }
+        const steps = [...byStep.keys()].sort((a, b) => a - b);
+        for (let i = 1; i < steps.length; i++) {
+          const prevGroup = byStep.get(steps[i - 1] as number) ?? [];
+          if (prevGroup.length !== 1) continue;
+          const parent = prevGroup[0];
+          if (!parent) continue;
+          const group = byStep.get(steps[i] as number) ?? [];
+          // 本组已有卡挂在 P 名下，才说明本组属于 P 的分支；
+          // 一张都没有时不凭空挂接（可能是用户有意放在顶层）
+          if (!group.some((m) => (m.parentId ?? 0) === parent.id)) continue;
+          for (const m of group) {
+            if ((m.parentId ?? 0) !== 0) continue;
+            await db
+              .update(schema.canvasModules)
+              .set({ parentId: parent.id })
+              .where(eq(schema.canvasModules.id, m.id));
+            m.parentId = parent.id;
+            done.push(
+              `项目 ${m.projectId}：把「${labelOf(m)}」（id=${m.id}）挂到「${labelOf(parent)}」（id=${parent.id}）名下，与同组卡并列`,
+            );
+          }
+        }
+      }
+      const after = await db
+        .select()
+        .from(schema.canvasModules)
+        .where(eq(schema.canvasModules.city, city))
+        .orderBy(schema.canvasModules.id)
+        .limit(2000);
+      return {
+        changed: done.length > 0,
+        actions: done,
+        modules: after.map((m) => ({
+          id: m.id,
+          projectId: m.projectId,
+          label: labelOf(m),
+          parentId: m.parentId ?? 0,
+        })),
+      };
+    },
+  }),
+
   addCanvasModule: defineAction({
     description:
-      "往某城市画布加一个模块：kind=station 时给 line/station/direction（接口方向号 1/2）/terminal（该方向终点站），kind=text 时给 text（纯文字内容）；x/y 是画布世界坐标。line/station/terminal 都可留空——那就是一张空白五行到站卡，创建不调任何接口，之后在卡上就地填字（updateCanvasModule 改 line/station/terminal）。返回该城市画布全量。city 缺省为厦门。",
+      "往某城市画布加一个模块：kind=station 时给 line/station/direction（接口方向号 1/2）/terminal（该方向终点站），kind=text 时给 text（纯文字内容）；x/y 是画布世界坐标。line/station/terminal 都可留空——那就是一张空白五行到站卡，创建不调任何接口，之后在卡上就地填字（updateCanvasModule 改 line/station/terminal）。parentId>0 时新卡直接挂到那张卡后面成为它的子卡（路线树里接着往下续），parentId 指向的卡必须同城市同项目、不存在时按顶层处理；不传或 0 即顶层新卡。返回该城市画布全量。city 缺省为厦门。",
     request: z.object({
       kind: z.enum(["station", "text"]),
       line: z.string().max(20).optional(),
@@ -2874,6 +2968,7 @@ export const Actions = {
       terminal: z.string().max(40).optional(),
       text: z.string().max(200).optional(),
       note: z.string().max(100).optional(),
+      parentId: z.number().int().min(0).optional(),
       x: z.number().min(-10000).max(10000),
       y: z.number().min(-10000).max(10000),
       city: z.string().max(20).optional(),
@@ -2888,6 +2983,23 @@ export const Actions = {
         city,
         args.projectId,
       );
+      // 挂接目标必须同城市同项目；新卡还没有子卡，不可能成环，
+      // 目标不存在时按顶层处理（不让加卡失败）
+      let parentId: number | null = null;
+      if (args.parentId && args.parentId > 0) {
+        const pRows = await db
+          .select({ id: schema.canvasModules.id })
+          .from(schema.canvasModules)
+          .where(
+            and(
+              eq(schema.canvasModules.id, args.parentId),
+              eq(schema.canvasModules.city, city),
+              eq(schema.canvasModules.projectId, projectId),
+            ),
+          )
+          .limit(1);
+        if (pRows[0]) parentId = args.parentId;
+      }
       // 新卡默认接续为新的一步（当前最大步号 + 1），用户事后可并步
       const stepRows = await db
         .select({ stepIndex: schema.canvasModules.stepIndex })
@@ -2904,6 +3016,7 @@ export const Actions = {
       await db.insert(schema.canvasModules).values({
         city,
         projectId,
+        parentId,
         stepIndex: nextStep,
         kind: args.kind,
         line: args.kind === "station" ? normalizeLine(args.line ?? "") : "",

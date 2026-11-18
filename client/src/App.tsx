@@ -3369,6 +3369,7 @@ function CanvasView({
       terminal?: string;
       text?: string;
       note?: string;
+      parentId?: number;
       x: number;
       y: number;
     }) =>
@@ -3378,8 +3379,9 @@ function CanvasView({
         projectId: curProjectId > 0 ? curProjectId : undefined,
       }),
     onSuccess: (data) => {
-      // 新卡默认顶层（parentId 为空）：纵向流里排在主线最后，
-      // 用户事后在卡片「更多」里挂接到某张卡后面成分支路线。
+      // 不带 parentId 的新卡默认顶层（parentId 为空）：纵向流里排在
+      // 主线最后；卡片「更多」里的「＋ 在后面加一张 / ＋ 加并列方案」
+      // 会直接带上 parentId，新卡一落下就在树里就位，不用再挂接。
       applyCanvas(data);
     },
   });
@@ -4028,9 +4030,46 @@ function CanvasView({
     );
   };
 
-  // 每卡「更多」里的路线树工具：挂到某张卡后面（选父卡）/ 移到顶层。
-  // 选父卡时列出项目内其他卡，自己与自己的子孙不列（防环，服务端
-  // 还会再校验一次）。
+  // 一键加卡（路线树）：不用先在顶层加卡再回来挂接，点一下新卡
+  // 就直接生在本卡的树位置上。都是空白到站卡、零接口调用、自动
+  // 保存，落下后在卡上点选站名/线路即可。
+  // - 在后面加一张：parent = 本卡，出现在本卡下方缩进处，接着本
+  //   条路线往下走；本卡若是收起状态先展开，不然新卡会被折住。
+  // - 加并列方案：parent = 本卡的 parent，与本卡同层并列（中间
+  //   是「或」）；本卡是顶层卡时新卡也是顶层。
+  const addCardBehind = (m: CanvasModule) => {
+    if (collapsedIds.has(m.id)) toggleCollapsed(m.id);
+    addModuleMut.mutate({
+      kind: "station",
+      line: "",
+      station: "",
+      direction: 0,
+      terminal: "",
+      parentId: m.id,
+      x: Math.round(m.x),
+      y: Math.round(m.y + CANVAS_MODULE_H_EST + 32),
+    });
+  };
+  const addCardBeside = (m: CanvasModule) => {
+    if (m.parentId > 0 && collapsedIds.has(m.parentId)) {
+      toggleCollapsed(m.parentId);
+    }
+    addModuleMut.mutate({
+      kind: "station",
+      line: "",
+      station: "",
+      direction: 0,
+      terminal: "",
+      parentId: m.parentId,
+      x: Math.round(m.x + 24),
+      y: Math.round(m.y + CANVAS_MODULE_H_EST + 32),
+    });
+  };
+
+  // 每卡「更多」里的路线树工具：顶部是两个一键加卡入口（在后面
+  // 加一张 / 加并列方案），下面是挪动已存在卡的挂接（挂到某张卡
+  // 后面选父卡 / 移到顶层）。选父卡时列出项目内其他卡，自己与自
+  // 己的子孙不列（防环，服务端还会再校验一次）。
   const renderTreeTools = (node: CanvasTreeNode): ReactNode => {
     const m = node.mod;
     const label = canvasModLabel(m);
@@ -4092,7 +4131,38 @@ function CanvasView({
     }
     return (
       <div className="mt-2 border-t border-[var(--border)] pt-2">
-        <div className="flex flex-wrap gap-1.5">
+        <div className="flex flex-col gap-1.5">
+          <button
+            type="button"
+            disabled={addModuleMut.isPending}
+            onClick={() => addCardBehind(m)}
+            aria-label={`在 ${label} 后面加一张空白到站卡，接着这条路线往下`}
+            className="min-h-11 bg-[var(--accent)] px-3 text-left text-base font-bold text-[var(--accent-ink)] [border-radius:8px] disabled:opacity-50"
+          >
+            ＋ 在后面加一张
+            <span className="text-sm font-medium opacity-80">
+              {" "}
+              · 接着这条路线往下
+            </span>
+          </button>
+          <button
+            type="button"
+            disabled={addModuleMut.isPending}
+            onClick={() => addCardBeside(m)}
+            aria-label={`给 ${label} 加一张并列的空白到站卡，同层备选，任选其一`}
+            className="min-h-11 bg-[var(--surface2)] px-3 text-left text-base font-bold text-[var(--text)] [border-radius:8px] disabled:opacity-50"
+          >
+            ＋ 加并列方案
+            <span className="text-sm font-medium text-[var(--dim)]">
+              {" "}
+              · 和这张同层，任选其一
+            </span>
+          </button>
+        </div>
+        <p className="mt-1 text-xs text-[var(--dim)]">
+          加的都是空白到站卡，落下后点卡上的站名、线路就能选，不用打字。
+        </p>
+        <div className="mt-2 flex flex-wrap gap-1.5">
           <button
             type="button"
             onClick={() => {
@@ -5113,7 +5183,7 @@ function CanvasView({
           操作说明（点开看）
         </summary>
         <p className="pb-1 text-xs leading-relaxed text-[var(--dim)]">
-          两种看法：自由画布自由拖动摆布，拖模块本体移动它（点中或拖动的模块会自动翻到最前），拖空白处平移画布，双指或滚轮缩放；纵向流是路线树，像二叉树一样分叉：顶层卡自上而下是主线（卡间向下的大箭头是「然后」），一张卡下面缩进挂着的子卡是它分出的不同路线，同父的子卡之间标「或」任选其一，子卡下面还能再挂子卡、继续往下分。带子卡的卡能点「收起」把整条支线折成一行摘要，点摘要重新展开，收起状态会记住。卡面只留核心信息（站名/线路/方向/第 1 班/第 2 班/数据时间）和一行操作（开始/停止、点查、更多）；存库、删除、备注、挂接都收在卡片的「更多」里，点开才显示，一次只开一张。挂接：在「更多」里点「挂到某张卡后面」再点选一张卡，这张卡就成为它的子卡（分支路线）；「移到顶层」解除挂接回到主线；不能挂到自己或自己的子卡下面（会绕成圈）。新加的卡默认在顶层主线，摆好后在「更多」里挂接。自由画布里每张卡左上角有步号徽章（旧的步骤编号，同一步多卡标方案A/B/C）。连线（自由画布）：按住模块右侧的蓝点拖到另一个模块上松手（虚线带箭头）；整删在卡片「更多」里点「删除」（会先确认一次；删掉一张卡，它的子卡会自动改挂到它的上一级）。到站卡可开始/停止：停止后变灰待机、不查车。打开画布不自动查车：有缓存先看缓存，每张到站卡点刷新只查它自己。到站卡前三行（站名/线路/方向）点一下先出可选项点选——方向行点 ◀ ▶ 直接在两个终点站之间切换、点方向文字出终点站二选一，站名从站序里挑、线路从你用过的里面挑，实在没有选项才打字，选完自动保存；「＋ 加模块」里可以直接放一张空白卡，不用先查线路。配好的模块点卡片「更多」里的「存库」存入模块库，之后在「＋ 加模块 → 我的模块库」点一下就放一份副本到画布上，副本和模板互不影响。页头点项目名可以切换项目，「⋯」菜单里新建、改名、删除项目。项目里的模块、连线、位置改完即存，切走再回来原样恢复。
+          两种看法：自由画布自由拖动摆布，拖模块本体移动它（点中或拖动的模块会自动翻到最前），拖空白处平移画布，双指或滚轮缩放；纵向流是路线树，像二叉树一样分叉：顶层卡自上而下是主线（卡间向下的大箭头是「然后」），一张卡下面缩进挂着的子卡是它分出的不同路线，同父的子卡之间标「或」任选其一，子卡下面还能再挂子卡、继续往下分。带子卡的卡能点「收起」把整条支线折成一行摘要，点摘要重新展开，收起状态会记住。卡面只留核心信息（站名/线路/方向/第 1 班/第 2 班/数据时间）和一行操作（开始/停止、点查、更多）；存库、删除、备注、挂接都收在卡片的「更多」里，点开才显示，一次只开一张。挂接：在「更多」里点「挂到某张卡后面」再点选一张卡，这张卡就成为它的子卡（分支路线）；「移到顶层」解除挂接回到主线；不能挂到自己或自己的子卡下面（会绕成圈）。续接新卡不用挂接：在某张卡的「更多」顶部点「＋ 在后面加一张」，新卡直接生在它下面接着往下；点「＋ 加并列方案」，新卡和它同层并列、中间是「或」。加的都是空白到站卡，落下后点选站名线路即可。「＋ 加模块」新放的卡默认在顶层主线。自由画布里每张卡左上角有步号徽章（旧的步骤编号，同一步多卡标方案A/B/C）。连线（自由画布）：按住模块右侧的蓝点拖到另一个模块上松手（虚线带箭头）；整删在卡片「更多」里点「删除」（会先确认一次；删掉一张卡，它的子卡会自动改挂到它的上一级）。到站卡可开始/停止：停止后变灰待机、不查车。打开画布不自动查车：有缓存先看缓存，每张到站卡点刷新只查它自己。到站卡前三行（站名/线路/方向）点一下先出可选项点选——方向行点 ◀ ▶ 直接在两个终点站之间切换、点方向文字出终点站二选一，站名从站序里挑、线路从你用过的里面挑，实在没有选项才打字，选完自动保存；「＋ 加模块」里可以直接放一张空白卡，不用先查线路。配好的模块点卡片「更多」里的「存库」存入模块库，之后在「＋ 加模块 → 我的模块库」点一下就放一份副本到画布上，副本和模板互不影响。页头点项目名可以切换项目，「⋯」菜单里新建、改名、删除项目。项目里的模块、连线、位置改完即存，切走再回来原样恢复。
         </p>
       </details>
     </section>
