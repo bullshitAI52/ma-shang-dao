@@ -2957,6 +2957,97 @@ export const Actions = {
     },
   }),
 
+  attachXiabanSm2ToMacuo: defineAction({
+    description:
+      "一次性理顺厦门「下班」项目的回程路线树（幂等，可重复调用、已理顺时什么都不改）：用户确认回程结构是先在马厝坐 24 路、到 SM2 再换 33 路或 133 路回家，即马厝·24路是回程第一张（树干），SM2·33路与 SM2·133路两张同层并列挂在它名下（中间「或」）。本动作只在该城市名为「下班」的项目里，按站名+线路认卡（父卡：马厝·24路；子卡：SM2·33路、SM2·133路），把两张子卡的 parentId 改为父卡 id；只改这两处 parentId，站名/线路/步号/启停/坐标与「上班」项目一律不动，认不到卡时什么都不改。返回实际执行的动作与理顺后全部模块的挂接清单。city 缺省为厦门。",
+    request: z.object({
+      city: z.string().max(20).optional(),
+    }),
+    response: z.object({
+      changed: z.boolean(),
+      actions: z.array(z.string()),
+      modules: z.array(
+        z.object({
+          id: z.number(),
+          projectId: z.number(),
+          label: z.string(),
+          parentId: z.number(),
+        }),
+      ),
+    }),
+    async handler(ctx, args) {
+      const city = cityOf(args.city);
+      const db = ctx.db<typeof schema>();
+      const done: string[] = [];
+      const labelOf = (m: typeof schema.canvasModules.$inferSelect) =>
+        m.kind === "station"
+          ? `${m.station || "（未填站名）"} · ${m.line || "（未填线路）"}`
+          : m.text || "（文本卡）";
+      const listAll = async () => {
+        const all = await db
+          .select()
+          .from(schema.canvasModules)
+          .where(eq(schema.canvasModules.city, city))
+          .orderBy(schema.canvasModules.id)
+          .limit(2000);
+        return all.map((m) => ({
+          id: m.id,
+          projectId: m.projectId,
+          label: labelOf(m),
+          parentId: m.parentId ?? 0,
+        }));
+      };
+      const projRows = await db
+        .select()
+        .from(schema.canvasProjects)
+        .where(
+          and(
+            eq(schema.canvasProjects.city, city),
+            eq(schema.canvasProjects.name, "下班"),
+          ),
+        )
+        .limit(1);
+      const project = projRows[0];
+      if (!project) return { changed: false, actions: done, modules: await listAll() };
+      const mods = await db
+        .select()
+        .from(schema.canvasModules)
+        .where(
+          and(
+            eq(schema.canvasModules.city, city),
+            eq(schema.canvasModules.projectId, project.id),
+          ),
+        )
+        .orderBy(schema.canvasModules.id)
+        .limit(400);
+      const parent = mods.find(
+        (m) => m.kind === "station" && m.station === "马厝" && m.line === "24路",
+      );
+      if (!parent) return { changed: false, actions: done, modules: await listAll() };
+      const children = mods.filter(
+        (m) =>
+          m.kind === "station" &&
+          m.station === "SM2" &&
+          (m.line === "33路" || m.line === "133路"),
+      );
+      for (const child of children) {
+        if ((child.parentId ?? 0) === parent.id) continue;
+        await db
+          .update(schema.canvasModules)
+          .set({ parentId: parent.id })
+          .where(eq(schema.canvasModules.id, child.id));
+        done.push(
+          `项目「下班」（id=${project.id}）：把「${labelOf(child)}」（id=${child.id}）挂到「${labelOf(parent)}」（id=${parent.id}）名下，与另一张 SM2 卡并列`,
+        );
+      }
+      return {
+        changed: done.length > 0,
+        actions: done,
+        modules: await listAll(),
+      };
+    },
+  }),
+
   addCanvasModule: defineAction({
     description:
       "往某城市画布加一个模块：kind=station 时给 line/station/direction（接口方向号 1/2）/terminal（该方向终点站），kind=text 时给 text（纯文字内容）；x/y 是画布世界坐标。line/station/terminal 都可留空——那就是一张空白五行到站卡，创建不调任何接口，之后在卡上就地填字（updateCanvasModule 改 line/station/terminal）。parentId>0 时新卡直接挂到那张卡后面成为它的子卡（路线树里接着往下续），parentId 指向的卡必须同城市同项目、不存在时按顶层处理；不传或 0 即顶层新卡。返回该城市画布全量。city 缺省为厦门。",
