@@ -603,6 +603,18 @@ const stationArrivalsResponse = z.object({
   ),
 });
 
+// 「我的站牌」打开时只读服务端 90 秒缓存的快照：有缓存的卡先显示缓存，
+// 没缓存的卡返回 null 让前端显示「点查」，全程不调用上游接口。
+const boardSnapshotResponse = z.object({
+  entries: z.array(
+    z.object({
+      id: z.number(),
+      realtime: lineRealtimeResponse.nullable(),
+      arrivals: stationArrivalsResponse.nullable(),
+    }),
+  ),
+});
+
 const nearbyStationsResponse = z.object({
   ok: z.boolean(),
   error: z.string(),
@@ -1191,6 +1203,48 @@ export const Actions = {
       } catch (e) {
         return { ok: false, error: errMsg(e), city, source: "amap", lines: [] };
       }
+    },
+  }),
+
+  getBoardSnapshot: defineAction({
+    description:
+      "「我的站牌」打开时读取收藏条目在服务端 90 秒缓存里的已有结果：只读缓存、绝不调用上游接口；某条没有缓存时该条返回 null，前端显示「点查」由用户逐卡刷新。",
+    request: z.object({
+      city: z.string().max(20).optional(),
+      items: z
+        .array(
+          z.object({
+            id: z.number().int().positive(),
+            kind: z.enum(["lineStation", "station"]),
+            value: z.string().min(1).max(40),
+            label: z.string().min(1).max(40),
+          }),
+        )
+        .max(50),
+    }),
+    response: boardSnapshotResponse,
+    async handler(ctx, args): Promise<z.infer<typeof boardSnapshotResponse>> {
+      void ctx;
+      const city = cityOf(args.city);
+      const entries = args.items.map((it) => {
+        if (it.kind === "lineStation") {
+          const key = `rt|${city}|${normalizeLine(it.value)}|${it.label.trim()}`;
+          const hit = cacheGet<z.infer<typeof lineRealtimeResponse>>(key);
+          return {
+            id: it.id,
+            realtime: hit && hit.ok ? { ...hit, cached: true } : null,
+            arrivals: null,
+          };
+        }
+        const key = `sa|${city}|${it.label.trim()}`;
+        const hit = cacheGet<z.infer<typeof stationArrivalsResponse>>(key);
+        return {
+          id: it.id,
+          realtime: null,
+          arrivals: hit && hit.ok ? { ...hit, cached: true } : null,
+        };
+      });
+      return { entries };
     },
   }),
 
