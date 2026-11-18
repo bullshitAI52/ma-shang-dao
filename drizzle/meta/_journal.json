@@ -29,6 +29,13 @@
       "when": 1794958220745,
       "tag": "0004_favorites_city_column",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1794961592194,
+      "tag": "0005_settings_table",
+      "breakpoints": true
     }
   ]
 }

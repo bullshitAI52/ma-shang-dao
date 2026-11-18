@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { SafeAreaTopScrim } from "@hatch/space-sdk/client";
 import { api, type ApiResponse } from "./api";
@@ -33,9 +33,20 @@ function loadStoredCity(): string {
   }
 }
 
+function hasStoredCity(): boolean {
+  try {
+    return !!window.localStorage.getItem(CITY_STORAGE_KEY)?.trim();
+  } catch {
+    return false;
+  }
+}
+
+type SettingsData = ApiResponse<typeof api, "getSettings">;
+
 // 底部主导航：一屏只干一件事。原「线路」「站点」并入「查车」，
-// 收藏（线路/站点/常用路线）集中到「收藏」页。
-type Tab = "home" | "route" | "nearby" | "metro" | "favorites";
+// 收藏（线路/站点/常用路线）集中到「收藏」页。设置页从顶部齿轮进入，
+// 不占底部导航。
+type Tab = "home" | "route" | "nearby" | "metro" | "favorites" | "settings";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "home", label: "查车" },
@@ -147,7 +158,7 @@ export function App() {
     else runRealtime(f.value, f.label);
   };
 
-  // 实时到站（90 秒内重复查询走服务端缓存，forceRefresh 才真调接口）
+  // 实时到站（缓存期内重复查询走服务端缓存，forceRefresh 才真调接口）
   const rt = useMutation({
     mutationFn: (args: { line: string; station: string; forceRefresh?: boolean }) =>
       api.queryLineRealtime({ ...args, city }),
@@ -282,6 +293,16 @@ export function App() {
     queryFn: () => api.getMetroLines({ city }),
   });
 
+  // 设置（默认城市等）：服务端存一份默认城市。本机从没存过城市时，
+  // 用服务端默认城市作初始值；存过就以本机为准——与顶部切换共用同一
+  // 份 city 状态，不另做一套。
+  const settingsQ = useQuery({
+    queryKey: ["settings"],
+    queryFn: () => api.getSettings({}),
+  });
+  const hadStoredCityRef = useRef(hasStoredCity());
+  const appliedServerDefaultRef = useRef(false);
+
   // 切换城市：持久化 + 清掉上一个城市的查询结果，避免串城市显示
   const switchCity = (raw: string) => {
     const c = raw.trim().replace(/\s+/g, "");
@@ -306,6 +327,22 @@ export function App() {
     setHomeMode("query");
     setLocError("");
   };
+
+  // 首次拿到服务端设置且本机没存过城市时，套用服务端默认城市（只做一次）
+  const serverDefaultCity = settingsQ.data?.defaultCity ?? "";
+  useEffect(() => {
+    if (appliedServerDefaultRef.current) return;
+    if (hadStoredCityRef.current) {
+      appliedServerDefaultRef.current = true;
+      return;
+    }
+    if (serverDefaultCity) {
+      appliedServerDefaultRef.current = true;
+      switchCity(serverDefaultCity);
+    }
+    // switchCity 每次渲染都是新引用，只按服务端默认值触发一次即可
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [serverDefaultCity]);
 
   // 统一智能搜索（解析规则照机器人 parse_input）：一个输入自动分发到对应功能并直接出结果
   const [smart, setSmart] = useState("");
@@ -411,6 +448,18 @@ export function App() {
                   搜
                 </button>
               </form>
+              <button
+                type="button"
+                onClick={() => setTab("settings")}
+                aria-label="打开设置"
+                className={`shrink-0 px-3 text-lg [border-radius:8px] ${
+                  tab === "settings"
+                    ? "bg-[var(--surface2)] font-bold text-[var(--accent)]"
+                    : "bg-[var(--surface2)] text-[var(--dim)]"
+                }`}
+              >
+                ⚙
+              </button>
             </div>
           )}
         </header>
@@ -833,6 +882,15 @@ export function App() {
           </section>
         )}
 
+        {/* ============ 设置 ============ */}
+        {tab === "settings" && (
+          <SettingsPanel
+            city={city}
+            onBack={() => setTab("home")}
+            onPickCity={(c) => switchCity(c)}
+          />
+        )}
+
         <footer className="mt-10 text-center text-xs text-[var(--dim)]">
           实时数据来自公交实时接口 · 路线规划由高德地图提供
         </footer>
@@ -880,7 +938,7 @@ function boardHeadline(bus: BusInfo): string {
 // 「我的站牌」：收藏里的 lineStation 与 station 各成一张卡。打开页面不
 // 自动调接口——先向服务端要一份只读缓存快照（getBoardSnapshot），有
 // 缓存的卡直接显示并标数据时间，没缓存的卡是「点查」状态；每张卡各自
-// 刷新，只查自己那一张（继续吃 90 秒缓存），不做一键全刷。
+// 刷新，只查自己那一张（继续吃服务端缓存），不做一键全刷。
 function BoardSection({
   city,
   favorites,
@@ -1175,7 +1233,7 @@ function RealtimePanel({
       <ResultHeader
         badge={data.line}
         title={data.station}
-        meta={`数据时间 ${data.queriedAt}${data.cached ? " · 90 秒内缓存（不重复调接口）" : ""}`}
+        meta={`数据时间 ${data.queriedAt}${data.cached ? " · 缓存（不重复调接口）" : ""}`}
         favActive={favActive}
         favLabel={`收藏 ${data.line} 在 ${data.station} 的到站查询`}
         onToggleFav={onToggleFav}
@@ -1327,7 +1385,7 @@ function StationArrivalsPanel({
     <div className="mt-6">
       <ResultHeader
         title={data.station}
-        meta={`数据时间 ${data.queriedAt} · 点线路看该线双向详情${data.cached ? " · 90 秒内缓存（不重复调接口）" : ""}`}
+        meta={`数据时间 ${data.queriedAt} · 点线路看该线双向详情${data.cached ? " · 缓存（不重复调接口）" : ""}`}
         favActive={favActive}
         favLabel={`收藏站点 ${data.station}`}
         onToggleFav={onToggleFav}
@@ -1418,5 +1476,301 @@ function RoutePlansPanel({ data }: { data: RoutePlanResult }) {
         );
       })}
     </div>
+  );
+}
+
+// ---------- 设置页 ----------
+// 从顶部齿轮进入，不占底部导航。分两组：API 密钥、偏好设置。
+// key 只存服务端：这里只看得到来源状态与末 4 位掩码，输入框留空 =
+// 不修改；填新值点保存才替换；「清除」删掉界面存的 key、回退到文件。
+// 默认城市与顶部城市切换共用同一份 city 状态：改这里就是改当前城市，
+// 同时存一份到服务端作默认。
+
+const CACHE_TTL_OPTIONS = [60, 90, 120, 180];
+
+function keyStatusText(st: SettingsData["apizero"]): string {
+  if (st.source === "ui") return `已设置（界面） · ••••${st.suffix}`;
+  if (st.source === "file") return `已设置（文件） · ••••${st.suffix}`;
+  return "未设置";
+}
+
+function SettingsPanel({
+  city,
+  onBack,
+  onPickCity,
+}: {
+  city: string;
+  onBack: () => void;
+  onPickCity: (c: string) => void;
+}) {
+  const queryClient = useQueryClient();
+  const settings = useQuery({
+    queryKey: ["settings"],
+    queryFn: () => api.getSettings({}),
+  });
+  const data = settings.data;
+
+  const [apizeroInput, setApizeroInput] = useState("");
+  const [amapInput, setAmapInput] = useState("");
+  const [ttlSel, setTtlSel] = useState<number | null>(null);
+  const [feedback, setFeedback] = useState("");
+  const [testResults, setTestResults] = useState<
+    Partial<Record<"apizero" | "amap", { ok: boolean; message: string }>>
+  >({});
+
+  const applyData = (d: SettingsData) =>
+    queryClient.setQueryData(["settings"], d);
+
+  const saveMut = useMutation({
+    mutationFn: (args: {
+      apizeroKey?: string;
+      amapKey?: string;
+      defaultCity?: string;
+      cacheTtlSec?: number;
+    }) => api.saveSettings(args),
+    onSuccess: (d) => {
+      applyData(d);
+      setApizeroInput("");
+      setAmapInput("");
+      setFeedback("已保存，立即生效。");
+    },
+    onError: (e) => setFeedback(`保存失败：${String(e)}`),
+  });
+
+  const clearMut = useMutation({
+    mutationFn: (service: "apizero" | "amap") => api.clearApiKey({ service }),
+    onSuccess: (d, service) => {
+      applyData(d);
+      if (service === "apizero") setApizeroInput("");
+      else setAmapInput("");
+      setFeedback(
+        service === "apizero"
+          ? "已清除界面里存的实时公交 key，之后用服务器文件里的 key。"
+          : "已清除界面里存的高德 key，之后用服务器文件里的 key。",
+      );
+    },
+    onError: (e) => setFeedback(`清除失败：${String(e)}`),
+  });
+
+  const testMut = useMutation({
+    mutationFn: (args: { service: "apizero" | "amap"; key?: string }) =>
+      api.testApiKey(args),
+  });
+  const runTest = (service: "apizero" | "amap") => {
+    const typed = service === "apizero" ? apizeroInput.trim() : amapInput.trim();
+    testMut.mutate(
+      { service, ...(typed ? { key: typed } : {}) },
+      {
+        onSuccess: (r) =>
+          setTestResults((prev) => ({ ...prev, [service]: r })),
+        onError: (e) =>
+          setTestResults((prev) => ({
+            ...prev,
+            [service]: { ok: false, message: `测试失败：${String(e)}` },
+          })),
+      },
+    );
+  };
+
+  const effectiveTtl = ttlSel ?? data?.cacheTtlSec ?? 90;
+
+  const onSave = () => {
+    setFeedback("");
+    saveMut.mutate({
+      ...(apizeroInput.trim() ? { apizeroKey: apizeroInput.trim() } : {}),
+      ...(amapInput.trim() ? { amapKey: amapInput.trim() } : {}),
+      defaultCity: city,
+      cacheTtlSec: effectiveTtl,
+    });
+  };
+
+  const keyField = (
+    service: "apizero" | "amap",
+    title: string,
+    desc: string,
+    value: string,
+    setValue: (v: string) => void,
+    st: SettingsData["apizero"] | undefined,
+  ) => (
+    <div className="border-t border-[var(--border)] py-4 first:border-t-0 first:pt-0 last:pb-0">
+      <div className="flex items-baseline justify-between gap-3">
+        <h3 className="text-base font-bold text-[var(--text)]">{title}</h3>
+        <span className="shrink-0 text-xs text-[var(--dim)]">
+          {st ? keyStatusText(st) : "读取中…"}
+        </span>
+      </div>
+      <p className="mt-1 text-xs text-[var(--dim)]">{desc}</p>
+      <label
+        htmlFor={`key-${service}`}
+        className="mt-3 mb-1 block text-sm text-[var(--dim)]"
+      >
+        新 key（留空 = 不修改）
+      </label>
+      <input
+        id={`key-${service}`}
+        type="password"
+        className="w-full border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-base text-[var(--text)] [border-radius:8px] outline-none focus:border-[var(--accent)]"
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        placeholder={st?.source === "none" ? "粘贴 key 到这里" : "留空表示不修改"}
+        autoComplete="off"
+      />
+      <div className="mt-2.5 flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          onClick={() => runTest(service)}
+          disabled={testMut.isPending}
+          aria-label={`测试${title}`}
+          className="bg-[var(--surface2)] px-3 text-sm font-medium text-[var(--text)] [border-radius:8px] disabled:opacity-50"
+        >
+          {testMut.isPending && testMut.variables?.service === service
+            ? "测试中…"
+            : "测试"}
+        </button>
+        {service === "apizero" && (
+          <span className="text-xs text-[var(--dim)]">测试将消耗 1 次调用</span>
+        )}
+        {st?.source === "ui" && (
+          <button
+            type="button"
+            onClick={() => clearMut.mutate(service)}
+            disabled={clearMut.isPending}
+            aria-label={`清除界面里存的${title}`}
+            className="px-3 text-sm font-medium text-[var(--danger)] [border-radius:8px] disabled:opacity-50"
+          >
+            清除
+          </button>
+        )}
+      </div>
+      {testResults[service] && (
+        <p
+          className={`mt-2 text-sm ${testResults[service].ok ? "text-[var(--text)]" : "text-[var(--danger)]"}`}
+          role="status"
+        >
+          {testResults[service].ok ? "✓ " : "✗ "}
+          {testResults[service].message}
+        </p>
+      )}
+    </div>
+  );
+
+  return (
+    <section aria-label="设置" className="mt-5">
+      <button
+        type="button"
+        onClick={onBack}
+        className="text-sm font-medium text-[var(--accent)]"
+      >
+        ‹ 返回
+      </button>
+      <h2 className="mt-3 text-xl font-bold text-[var(--text)]">设置</h2>
+
+      {settings.isError && (
+        <ErrorBox
+          message={`设置读取失败：${String(settings.error)}`}
+          onRetry={() => settings.refetch()}
+        />
+      )}
+
+      <div className="mt-5">
+        <SectionTitle>API 密钥</SectionTitle>
+        <div className="mt-2 border border-[var(--border)] bg-[var(--surface)] px-4 py-4 [border-radius:var(--radius)]">
+          {keyField(
+            "apizero",
+            "实时公交 key（apizero）",
+            "线路详情、站点搜索、实时到站都用它，按次计费。界面里存的优先，没有才用服务器上的 ~/.apizero_key 文件。",
+            apizeroInput,
+            setApizeroInput,
+            data?.apizero,
+          )}
+          {keyField(
+            "amap",
+            "高德 key",
+            "路线规划、附近站点、其他城市地铁都用它。界面里存的优先，没有才用服务器上的 ~/.amap_key 文件。",
+            amapInput,
+            setAmapInput,
+            data?.amap,
+          )}
+        </div>
+        <p className="mt-2 text-xs text-[var(--dim)]">
+          key 只保存在服务端，这里只显示末 4 位；输入框留空保存不会改动已有的 key。
+        </p>
+      </div>
+
+      <div className="mt-6">
+        <SectionTitle>偏好设置</SectionTitle>
+        <div className="mt-2 border border-[var(--border)] bg-[var(--surface)] px-4 py-4 [border-radius:var(--radius)]">
+          <div>
+            <label
+              htmlFor="default-city"
+              className="mb-1 block text-sm text-[var(--dim)]"
+            >
+              默认城市（与顶部城市切换是同一个，改这里立即切换当前城市）
+            </label>
+            <select
+              id="default-city"
+              aria-label="默认城市"
+              className="w-full border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-base text-[var(--text)] [border-radius:8px] outline-none focus:border-[var(--accent)]"
+              value={PRESET_CITIES.includes(city) ? city : "__current"}
+              onChange={(e) => {
+                const c = e.target.value;
+                if (c === "__current") return;
+                setFeedback("");
+                onPickCity(c);
+                saveMut.mutate({ defaultCity: c });
+              }}
+            >
+              {!PRESET_CITIES.includes(city) && (
+                <option value="__current">{city}</option>
+              )}
+              {PRESET_CITIES.map((c) => (
+                <option key={c} value={c}>
+                  {c}
+                </option>
+              ))}
+            </select>
+            <p className="mt-1 text-xs text-[var(--dim)]">
+              不在列表里的城市，用顶部城市切换里的「自定义城市…」选好后，这里会自动跟上。
+            </p>
+          </div>
+
+          <div className="mt-5">
+            <label
+              htmlFor="cache-ttl"
+              className="mb-1 block text-sm text-[var(--dim)]"
+            >
+              查询缓存时长（实时查询结果缓存多久，越长越省接口额度）
+            </label>
+            <select
+              id="cache-ttl"
+              aria-label="查询缓存时长"
+              className="w-full border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-base text-[var(--text)] [border-radius:8px] outline-none focus:border-[var(--accent)]"
+              value={effectiveTtl}
+              onChange={(e) => setTtlSel(Number(e.target.value))}
+            >
+              {CACHE_TTL_OPTIONS.map((s) => (
+                <option key={s} value={s}>
+                  {s} 秒{s === 90 ? "（默认）" : ""}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <button
+        type="button"
+        onClick={onSave}
+        disabled={saveMut.isPending || !data}
+        className="mt-6 w-full bg-[var(--accent)] px-5 py-2.5 font-bold text-[var(--accent-ink)] [border-radius:8px] disabled:opacity-50"
+      >
+        {saveMut.isPending ? "保存中…" : "保存设置"}
+      </button>
+      {feedback && (
+        <p className="mt-3 text-center text-sm text-[var(--text)]" role="status">
+          {feedback}
+        </p>
+      )}
+    </section>
   );
 }

@@ -24,6 +24,63 @@ function cityOf(v: string | undefined): string {
   return t || DEFAULT_CITY;
 }
 
+// ---------- 设置（settings 表） ----------
+// API key 取用顺序：设置页里存的 key 优先，没有再回退主机上的 key
+// 文件（~/.apizero_key、~/.amap_key，由 privileged 读）。key 只存
+// 服务端，对前端只回来源状态与末 4 位掩码，绝不回完整值。
+
+const SETTING_APIZERO_KEY = "apizero_key";
+const SETTING_AMAP_KEY = "amap_key";
+const SETTING_DEFAULT_CITY = "default_city";
+const SETTING_CACHE_TTL = "cache_ttl_sec";
+
+const CACHE_TTL_CHOICES = [60, 90, 120, 180];
+const DEFAULT_CACHE_TTL_SEC = 90;
+
+async function getSetting(ctx: Ctx, key: string): Promise<string> {
+  try {
+    const db = ctx.db<typeof schema>();
+    const rows = await db
+      .select()
+      .from(schema.settings)
+      .where(eq(schema.settings.key, key))
+      .limit(1);
+    return rows[0]?.value ?? "";
+  } catch {
+    return "";
+  }
+}
+
+async function setSetting(ctx: Ctx, key: string, value: string): Promise<void> {
+  const db = ctx.db<typeof schema>();
+  await db
+    .insert(schema.settings)
+    .values({ key, value })
+    .onConflictDoUpdate({
+      target: schema.settings.key,
+      set: { value, updatedAt: new Date() },
+    });
+}
+
+async function deleteSetting(ctx: Ctx, key: string): Promise<void> {
+  const db = ctx.db<typeof schema>();
+  await db.delete(schema.settings).where(eq(schema.settings.key, key));
+}
+
+/** 设置页里存的 apizero key（没有返回空串，privileged 会回退读文件）。 */
+async function uiApizeroKey(ctx: Ctx): Promise<string> {
+  return (await getSetting(ctx, SETTING_APIZERO_KEY)).trim();
+}
+async function uiAmapKey(ctx: Ctx): Promise<string> {
+  return (await getSetting(ctx, SETTING_AMAP_KEY)).trim();
+}
+
+/** 当前生效的实时查询缓存秒数（设置值不在预设档位时回落 90）。 */
+async function cacheTtlSec(ctx: Ctx): Promise<number> {
+  const n = Number(await getSetting(ctx, SETTING_CACHE_TTL));
+  return CACHE_TTL_CHOICES.includes(n) ? n : DEFAULT_CACHE_TTL_SEC;
+}
+
 // ---------- shared shapes ----------
 
 const busSchema = z.object({
@@ -92,6 +149,7 @@ async function apizero(
 ): Promise<Record<string, unknown>> {
   const r = await ctx.executePrivileged(privileged.apizeroCall, {
     paramsJson: JSON.stringify(params),
+    keyOverride: await uiApizeroKey(ctx),
   });
   if (!r.ok) throw new Error(r.error || "公交数据接口请求失败");
   const parsed: unknown = JSON.parse(r.body || "{}");
@@ -106,6 +164,7 @@ async function amap(
   const r = await ctx.executePrivileged(privileged.amapGet, {
     path,
     paramsJson: JSON.stringify(params),
+    keyOverride: await uiAmapKey(ctx),
   });
   if (!r.ok) throw new Error(r.error || "高德地图接口请求失败");
   const parsed: unknown = JSON.parse(r.body || "{}");
@@ -228,11 +287,12 @@ async function geocode(
 }
 
 // ---------- 服务端缓存（额度保护） ----------
-// apizero 免费额度很小：实时查询结果缓存 90 秒，同一查询 90 秒内重复请求
-// 直接返回缓存、不再调用接口；只有客户端显式「强制刷新」才绕过缓存。
+// apizero 免费额度很小：实时查询结果缓存一段时间（默认 90 秒，设置页
+// 可调 60/90/120/180 秒），同一查询在缓存期内重复请求直接返回缓存、
+// 不再调用接口；只有客户端显式「强制刷新」才绕过缓存。缓存时长在写入
+// 时按当前设置取值，改设置后新写入的条目即按新时长生效。
 // 线路站点序几乎不变，缓存 12 小时，仅用于推导「下一站」，不额外烧额度。
 
-const QUERY_CACHE_TTL_MS = 90_000;
 const STOPS_CACHE_TTL_MS = 12 * 60 * 60_000;
 
 type CacheEntry<T> = { expiresAt: number; value: T };
@@ -248,8 +308,9 @@ function cacheGet<T>(key: string): T | null {
   }
   return e.value as T;
 }
-function cacheSet(key: string, value: unknown): void {
-  queryCache.set(key, { expiresAt: Date.now() + QUERY_CACHE_TTL_MS, value });
+async function cacheSet(ctx: Ctx, key: string, value: unknown): Promise<void> {
+  const ttlMs = (await cacheTtlSec(ctx)) * 1000;
+  queryCache.set(key, { expiresAt: Date.now() + ttlMs, value });
 }
 
 /** 线路某方向的站点序（长缓存）；forceLineFetch=false 时只读缓存不调接口。 */
@@ -603,7 +664,7 @@ const stationArrivalsResponse = z.object({
   ),
 });
 
-// 「我的站牌」打开时只读服务端 90 秒缓存的快照：有缓存的卡先显示缓存，
+// 「我的站牌」打开时只读服务端缓存里的快照：有缓存的卡先显示缓存，
 // 没缓存的卡返回 null 让前端显示「点查」，全程不调用上游接口。
 const boardSnapshotResponse = z.object({
   entries: z.array(
@@ -689,6 +750,61 @@ const metroLinesResponse = z.object({
     }),
   ),
 });
+
+// ---------- 设置页 ----------
+
+const keyStatusSchema = z.object({
+  // ui = 设置页里存的；file = 服务器密钥文件；none = 都没有
+  source: z.enum(["ui", "file", "none"]),
+  // 生效中的 key 末 4 位（前端拼成 ••••xxxx 显示），未设置为空串
+  suffix: z.string(),
+});
+
+const settingsResponse = z.object({
+  apizero: keyStatusSchema,
+  amap: keyStatusSchema,
+  defaultCity: z.string(),
+  cacheTtlSec: z.number(),
+});
+
+const testKeyResponse = z.object({
+  ok: z.boolean(),
+  message: z.string(),
+});
+
+/** 汇总设置页要展示的全部状态：key 只回来源与末 4 位，绝不回完整值。 */
+async function buildSettings(
+  ctx: Ctx,
+): Promise<z.infer<typeof settingsResponse>> {
+  const [uiA, uiM, fileStatus, ttl] = await Promise.all([
+    uiApizeroKey(ctx),
+    uiAmapKey(ctx),
+    ctx
+      .executePrivileged(privileged.keyFileStatus, {})
+      .catch(() => ({
+        apizeroSet: false,
+        apizeroSuffix: "",
+        amapSet: false,
+        amapSuffix: "",
+      })),
+    cacheTtlSec(ctx),
+  ]);
+  const status = (
+    uiKey: string,
+    fileSet: boolean,
+    fileSuffix: string,
+  ): z.infer<typeof keyStatusSchema> => {
+    if (uiKey) return { source: "ui", suffix: uiKey.slice(-4) };
+    if (fileSet) return { source: "file", suffix: fileSuffix };
+    return { source: "none", suffix: "" };
+  };
+  return {
+    apizero: status(uiA, fileStatus.apizeroSet, fileStatus.apizeroSuffix),
+    amap: status(uiM, fileStatus.amapSet, fileStatus.amapSuffix),
+    defaultCity: (await getSetting(ctx, SETTING_DEFAULT_CITY)).trim(),
+    cacheTtlSec: ttl,
+  };
+}
 
 async function listFavoriteRoutes(
   ctx: Ctx,
@@ -807,7 +923,7 @@ export const Actions = {
 
   queryLineRealtime: defineAction({
     description:
-      "查某条线路在某个站的双向实时到站：每辆车剩几站、约几分钟到、预计到站时刻，并标出每个方向的下一站。站名可模糊，会先智能匹配该线路实际停靠的站。同一查询 90 秒内走服务端缓存不调接口，forceRefresh=true 才强制重新调用。",
+      "查某条线路在某个站的双向实时到站：每辆车剩几站、约几分钟到、预计到站时刻，并标出每个方向的下一站。站名可模糊，会先智能匹配该线路实际停靠的站。同一查询在缓存时长内（设置页可调，默认 90 秒）走服务端缓存不调接口，forceRefresh=true 才强制重新调用。",
     request: z.object({
       line: z.string().min(1).max(20),
       station: z.string().min(1).max(40),
@@ -880,8 +996,8 @@ export const Actions = {
           cached: false,
           directions,
         };
-        // 全部方向都失败的结果不进缓存，避免把短暂故障缓存 90 秒
-        if (directions.some((d) => !d.error)) cacheSet(cacheKey, result);
+        // 全部方向都失败的结果不进缓存，避免把短暂故障存进缓存
+        if (directions.some((d) => !d.error)) await cacheSet(ctx, cacheKey, result);
         return result;
       } catch (e) {
         return { ...empty, error: errMsg(e) };
@@ -919,7 +1035,7 @@ export const Actions = {
 
   queryStationArrivals: defineAction({
     description:
-      "查某个站双向所有经过线路的实时到站（每条线路的车辆剩几站、约几分钟到）；线路站点序已在缓存中时同时标出下一站。同一站 90 秒内走服务端缓存不调接口，forceRefresh=true 才强制重新调用。",
+      "查某个站双向所有经过线路的实时到站（每条线路的车辆剩几站、约几分钟到）；线路站点序已在缓存中时同时标出下一站。同一站在缓存时长内（设置页可调，默认 90 秒）走服务端缓存不调接口，forceRefresh=true 才强制重新调用。",
     request: z.object({
       station: z.string().min(1).max(40),
       city: z.string().max(20).optional(),
@@ -987,8 +1103,8 @@ export const Actions = {
           ...base,
           directions,
         };
-        // 全部方向都失败的结果不进缓存，避免把短暂故障缓存 90 秒
-        if (directions.some((d) => !d.error)) cacheSet(cacheKey, result);
+        // 全部方向都失败的结果不进缓存，避免把短暂故障存进缓存
+        if (directions.some((d) => !d.error)) await cacheSet(ctx, cacheKey, result);
         return result;
       } catch (e) {
         return { ok: false, error: errMsg(e), ...base };
@@ -1208,7 +1324,7 @@ export const Actions = {
 
   getBoardSnapshot: defineAction({
     description:
-      "「我的站牌」打开时读取收藏条目在服务端 90 秒缓存里的已有结果：只读缓存、绝不调用上游接口；某条没有缓存时该条返回 null，前端显示「点查」由用户逐卡刷新。",
+      "「我的站牌」打开时读取收藏条目在服务端缓存里的已有结果：只读缓存、绝不调用上游接口；某条没有缓存时该条返回 null，前端显示「点查」由用户逐卡刷新。",
     request: z.object({
       city: z.string().max(20).optional(),
       items: z
@@ -1369,6 +1485,121 @@ export const Actions = {
         .delete(schema.favoriteRoutes)
         .where(eq(schema.favoriteRoutes.id, args.id));
       return listFavoriteRoutes(ctx, cityOf(args.city));
+    },
+  }),
+
+  getSettings: defineAction({
+    description:
+      "读取设置页状态：两个 API key 各自的来源（界面存的/服务器文件/未设置）与末 4 位掩码（绝不返回完整 key）、默认城市、实时查询缓存秒数。",
+    request: z.object({}),
+    response: settingsResponse,
+    privileged: [privileged.keyFileStatus],
+    async handler(ctx): Promise<z.infer<typeof settingsResponse>> {
+      return buildSettings(ctx);
+    },
+  }),
+
+  saveSettings: defineAction({
+    description:
+      "保存设置：apizeroKey/amapKey 传了非空新值才替换界面里存的 key（不传或空串 = 不修改）；defaultCity 保存默认城市；cacheTtlSec 保存实时查询缓存秒数（60/90/120/180）。保存后即时生效，返回更新后的设置状态。",
+    request: z.object({
+      apizeroKey: z.string().max(200).optional(),
+      amapKey: z.string().max(200).optional(),
+      defaultCity: z.string().max(20).optional(),
+      cacheTtlSec: z.number().int().optional(),
+    }),
+    response: settingsResponse,
+    privileged: [privileged.keyFileStatus],
+    async handler(ctx, args): Promise<z.infer<typeof settingsResponse>> {
+      const aKey = (args.apizeroKey ?? "").trim();
+      if (aKey) await setSetting(ctx, SETTING_APIZERO_KEY, aKey);
+      const mKey = (args.amapKey ?? "").trim();
+      if (mKey) await setSetting(ctx, SETTING_AMAP_KEY, mKey);
+      if (args.defaultCity !== undefined) {
+        await setSetting(ctx, SETTING_DEFAULT_CITY, cityOf(args.defaultCity));
+      }
+      if (
+        args.cacheTtlSec !== undefined &&
+        CACHE_TTL_CHOICES.includes(args.cacheTtlSec)
+      ) {
+        await setSetting(ctx, SETTING_CACHE_TTL, String(args.cacheTtlSec));
+      }
+      return buildSettings(ctx);
+    },
+  }),
+
+  clearApiKey: defineAction({
+    description:
+      "清除设置页里存的某个 API key（service 为 apizero 或 amap），清除后回退到服务器密钥文件；返回更新后的设置状态。",
+    request: z.object({ service: z.enum(["apizero", "amap"]) }),
+    response: settingsResponse,
+    privileged: [privileged.keyFileStatus],
+    async handler(ctx, args): Promise<z.infer<typeof settingsResponse>> {
+      await deleteSetting(
+        ctx,
+        args.service === "apizero" ? SETTING_APIZERO_KEY : SETTING_AMAP_KEY,
+      );
+      return buildSettings(ctx);
+    },
+  }),
+
+  testApiKey: defineAction({
+    description:
+      "测试某个 API key 是否可用：key 传了就测这个新值，没传就测当前生效的 key（界面存的优先、否则文件）。高德用一次轻量地理编码调用；apizero 用一次站点搜索调用、会消耗 1 次接口调用。结果如实返回，接口报错原文放在 message 里。",
+    request: z.object({
+      service: z.enum(["apizero", "amap"]),
+      key: z.string().max(200).optional(),
+    }),
+    response: testKeyResponse,
+    privileged: [privileged.apizeroCall, privileged.amapGet],
+    async handler(ctx, args): Promise<z.infer<typeof testKeyResponse>> {
+      const typed = (args.key ?? "").trim();
+      if (args.service === "apizero") {
+        const keyOverride = typed || (await uiApizeroKey(ctx));
+        const r = await ctx.executePrivileged(privileged.apizeroCall, {
+          paramsJson: JSON.stringify({
+            type: "stations",
+            city: DEFAULT_CITY,
+            station: "火车站",
+          }),
+          keyOverride,
+        });
+        if (!r.ok) return { ok: false, message: r.error || "接口请求失败" };
+        let count = 0;
+        try {
+          count = arr(rec(JSON.parse(r.body || "{}")).stations).length;
+        } catch {
+          count = 0;
+        }
+        return {
+          ok: true,
+          message: `连接成功，接口正常返回（测试站搜到 ${count} 个相关站点）`,
+        };
+      }
+      const keyOverride = typed || (await uiAmapKey(ctx));
+      const r = await ctx.executePrivileged(privileged.amapGet, {
+        path: "/v3/geocode/geo",
+        // 地址要带城市名：只写「火车站」高德引擎会报 ENGINE_RESPONSE_DATA_ERROR
+        paramsJson: JSON.stringify({
+          address: `${DEFAULT_CITY}火车站`,
+          city: DEFAULT_CITY,
+        }),
+        keyOverride,
+      });
+      if (!r.ok) return { ok: false, message: r.error || "接口请求失败" };
+      let body: Record<string, unknown> = {};
+      try {
+        body = rec(JSON.parse(r.body || "{}"));
+      } catch {
+        return { ok: false, message: "高德接口返回了无法解析的内容" };
+      }
+      if (str(body.status) === "1") {
+        return { ok: true, message: "连接成功，高德接口正常返回" };
+      }
+      return {
+        ok: false,
+        message: `高德接口拒绝了请求：${str(body.info) || "未知错误"}${str(body.infocode) ? `（infocode ${str(body.infocode)}）` : ""}`,
+      };
     },
   }),
 } satisfies ActionsModule;

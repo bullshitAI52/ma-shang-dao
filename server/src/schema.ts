@@ -19,6 +19,17 @@ export const favorites = sqliteTable("favorites", {
     .$defaultFn(() => new Date()),
 });
 
+// 设置：键值对。存界面里填的 API key（apizero_key / amap_key，只存
+// 服务端、前端只见掩码）、默认城市（default_city）、查询缓存秒数
+// （cache_ttl_sec）。没有 UI 值的 key 服务端回退读主机上的 key 文件。
+export const settings = sqliteTable("settings", {
+  key: text("key").primaryKey(),
+  value: text("value").notNull(),
+  updatedAt: integer("updated_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
 // 常用路线：一组起点+终点，label 默认「起点 → 终点」，与 favorites 分开存。
 export const favoriteRoutes = sqliteTable("favorite_routes", {
   id: integer("id").primaryKey({ autoIncrement: true }),

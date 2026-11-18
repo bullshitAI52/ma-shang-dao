@@ -38,6 +38,15 @@
 - **省额度口径**: 打开页面不自动调 apizero——新增只读动作 getBoardSnapshot 按与 queryLineRealtime/queryStationArrivals 相同的缓存键（`rt|城市|线路|站名`、`sa|城市|站名`）查服务端 90 秒内存缓存，命中才返回（并标 cached），未命中返回 null、卡片显示「点查」；每张卡各自一个刷新按钮，走原有 query 动作继续吃 90 秒缓存，不做一键刷新全部。注意缓存键用收藏里存的官方站名，若用户当初用模糊关键词查询、缓存键对不上，快照未命中属正常，点查一次即对齐
 - **空状态**: 无 lineStation/station 收藏时只显示一句引导，不放假数据；卡片删除沿用收藏管理列表的删除，不另做一套
 
+### 设置页（2026-11-18 加）
+- **入口**: 顶部栏齿轮图标进入，底部仍为五入口（查车/规划/附近/地铁/收藏），不新增导航项
+- **存储**: 新增 settings 键值表（迁移 0005）：apizero_key、amap_key、default_city、cache_ttl_sec
+- **取 key 顺序**: 服务端先读 settings 里界面存的 key（actions 取出后经 keyOverride 传给 privileged），没有再回退 privileged 读 ~/.apizero_key、~/.amap_key 文件；文件方式继续可用
+- **安全口径**: key 只存服务端；getSettings 只回来源（ui/file/none）与生效 key 的末 4 位，绝不回完整值；keyFileStatus privileged 也只回文件 key 的存在与末 4 位。输入框留空 = 不修改；清除 = 删 settings 行回退文件
+- **测试**: testApiKey——高德用一次 /v3/geocode/geo 轻量调用判 status；apizero 用一次 stations 搜索（消耗 1 次调用，按钮旁已注明），错误原文（含额度用完）如实回显；可测输入框里未保存的新值
+- **默认城市**: 与顶部切换共用同一份 city 状态（设置页改城市即调用同一个 switchCity 并把该城市存为服务端 default_city）；本机 localStorage 从没存过城市时，首次打开用服务端 default_city 作初始城市
+- **缓存时长**: cache_ttl_sec 预设 60/90/120/180 秒（默认 90），cacheSet 写入时按当前设置取 TTL，改后新写入条目即时生效
+
 ## Long-term data behavior
 - **Refresh policy**: 无定时刷新、无自动轮询；所有实时数据只在用户主动查询/点刷新时向 API 拉取（apizero 按次计费）
 - **额度保护缓存（2026-11-18 加）**: 服务端内存缓存——实时到站（线路+站名关键词）与站点到站（站名）结果缓存 90 秒，90 秒内重复查询直接返回缓存并标「缓存」，不调 apizero；客户端另有「强制刷新」按钮绕过缓存真调接口。线路站点序单独长缓存 12 小时，仅用于推导方向「下一站」，不额外烧额度（查线路详情时顺带填充；站点视图只读该缓存、有才标下一站）
