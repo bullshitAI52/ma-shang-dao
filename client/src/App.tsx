@@ -11,6 +11,10 @@ type StationArrivalsResult = ApiResponse<typeof api, "queryStationArrivals">;
 type RoutePlanResult = ApiResponse<typeof api, "planRoute">;
 type Favorite = ApiResponse<typeof api, "listFavorites">["favorites"][number];
 type FavRoute = ApiResponse<typeof api, "listFavoriteRoutes">["routes"][number];
+type FavPlace = ApiResponse<typeof api, "listFavoritePlaces">["places"][number];
+type ActiveTrip = NonNullable<ApiResponse<typeof api, "getActiveTrip">["trip"]>;
+type TripSegment = ActiveTrip["segments"][number];
+type RoutePlan = RoutePlanResult["plans"][number];
 type BusInfo = RealtimeResult["directions"][number]["buses"][number];
 type BoardEntry = ApiResponse<typeof api, "getBoardSnapshot">["entries"][number];
 
@@ -46,7 +50,9 @@ type SettingsData = ApiResponse<typeof api, "getSettings">;
 // 底部主导航：一屏只干一件事。原「线路」「站点」并入「查车」，
 // 收藏（线路/站点/常用路线）集中到「收藏」页。设置页从顶部齿轮进入，
 // 不占底部导航。
-type Tab = "home" | "route" | "nearby" | "metro" | "favorites" | "settings";
+// "trip"（行程模式）与 "settings" 一样不占底部导航：行程从规划结果
+// 进入、或从查车页顶部的行程横条回到。
+type Tab = "home" | "route" | "nearby" | "metro" | "favorites" | "settings" | "trip";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "home", label: "查车" },
@@ -248,6 +254,9 @@ export function App() {
   // 路线规划
   const [origin, setOrigin] = useState("");
   const [destination, setDestination] = useState("");
+  // 把当前起点/终点存为常用地点时的命名表单（目标字段 + 名字输入）
+  const [savePlaceTarget, setSavePlaceTarget] = useState<"origin" | "destination" | null>(null);
+  const [savePlaceName, setSavePlaceName] = useState("");
   const rp = useMutation({
     mutationFn: (args: { origin: string; destination: string }) =>
       api.planRoute({ ...args, city }),
@@ -286,6 +295,69 @@ export function App() {
     else if (origin.trim() && destination.trim())
       addFavRoute.mutate({ origin: origin.trim(), destination: destination.trim() });
   };
+
+  // 常用地点（按城市隔离，服务端存）
+  const favPlaces = useQuery({
+    queryKey: ["favoritePlaces", city],
+    queryFn: () => api.listFavoritePlaces({ city }),
+  });
+  const placeList = favPlaces.data?.places ?? [];
+  const addPlace = useMutation({
+    mutationFn: (args: { name: string; address: string }) =>
+      api.addFavoritePlace({ ...args, city }),
+    onSuccess: (data) => queryClient.setQueryData(["favoritePlaces", city], data),
+  });
+  const removePlace = useMutation({
+    mutationFn: (id: number) => api.removeFavoritePlace({ id, city }),
+    onSuccess: (data) => queryClient.setQueryData(["favoritePlaces", city], data),
+  });
+
+  // 进行中的行程（服务端存，关页重开能续；同时只有一个）
+  const tripQ = useQuery({
+    queryKey: ["activeTrip"],
+    queryFn: () => api.getActiveTrip({}),
+  });
+  const activeTrip = tripQ.data?.trip ?? null;
+  const [tripFinished, setTripFinished] = useState(false);
+  const startTripMut = useMutation({
+    mutationFn: (args: { origin: string; destination: string; plan: RoutePlan }) =>
+      api.startTrip({
+        origin: args.origin,
+        destination: args.destination,
+        city,
+        segments: args.plan.segments,
+      }),
+    onSuccess: (data) => {
+      queryClient.setQueryData(["activeTrip"], data);
+      setTripFinished(false);
+      setTab("trip");
+    },
+  });
+  const startTrip = (plan: RoutePlan) => {
+    if (origin.trim() && destination.trim()) {
+      startTripMut.mutate({ origin: origin.trim(), destination: destination.trim(), plan });
+    }
+  };
+  const advanceTripMut = useMutation({
+    mutationFn: () => api.advanceTrip({}),
+    onSuccess: (data) => {
+      if (data.trip?.finished) {
+        // 行程完成：服务端已清除进行中状态，本地展示到达页
+        queryClient.setQueryData(["activeTrip"], { trip: null });
+        setTripFinished(true);
+      } else {
+        queryClient.setQueryData(["activeTrip"], data);
+      }
+    },
+  });
+  const endTripMut = useMutation({
+    mutationFn: () => api.endTrip({}),
+    onSuccess: (data) => {
+      queryClient.setQueryData(["activeTrip"], data);
+      setTripFinished(false);
+      setTab("home");
+    },
+  });
 
   // 地铁线路（按城市取：厦门内置数据，其他城市服务端由高德整理并缓存）
   const metro = useQuery({
@@ -467,6 +539,23 @@ export function App() {
         {/* ============ 查车 ============ */}
         {tab === "home" && (
           <>
+            {activeTrip && (
+              <button
+                type="button"
+                onClick={() => setTab("trip")}
+                aria-label="回到进行中的行程"
+                className="mt-4 flex w-full items-center gap-2 border border-[var(--accent)] bg-[var(--surface)] px-4 py-3 text-left [border-radius:var(--radius)]"
+              >
+                <span className="min-w-0 flex-1 truncate text-sm text-[var(--text)]">
+                  <span className="font-bold">行程进行中</span>
+                  {" · "}
+                  {activeTrip.origin} → {activeTrip.destination}
+                  {" · 第 "}
+                  {activeTrip.currentIndex + 1}/{activeTrip.segments.length} 段
+                </span>
+                <span className="shrink-0 text-sm font-bold text-[var(--accent)]">继续行程 ›</span>
+              </button>
+            )}
             {homeMode === "query" && (
               <section aria-label="实时到站查询">
                 {favRouteList.length > 0 && (
@@ -664,10 +753,12 @@ export function App() {
             <form onSubmit={onRouteSubmit} className="mt-5 space-y-3">
               <div>
                 <label htmlFor="route-origin" className="mb-1 block text-sm text-[var(--dim)]">起点</label>
+                <PlaceChips places={placeList} fieldLabel="起点" onPick={(p) => setOrigin(p.address)} />
                 <input id="route-origin" className={inputCls} value={origin} onChange={(e) => setOrigin(e.target.value)} placeholder={`输入${city}的起点地名`} autoComplete="off" />
               </div>
               <div>
                 <label htmlFor="route-dest" className="mb-1 block text-sm text-[var(--dim)]">终点</label>
+                <PlaceChips places={placeList} fieldLabel="终点" onPick={(p) => setDestination(p.address)} />
                 <div className="flex gap-2">
                   <input id="route-dest" className={inputCls} value={destination} onChange={(e) => setDestination(e.target.value)} placeholder="输入终点地名" autoComplete="off" />
                   <button
@@ -700,9 +791,90 @@ export function App() {
               </div>
             </form>
 
+            <div className="mt-4">
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  disabled={!origin.trim()}
+                  onClick={() => { setSavePlaceTarget(savePlaceTarget === "origin" ? null : "origin"); setSavePlaceName(""); }}
+                  aria-label="把当前起点存为常用地点"
+                  className="bg-[var(--surface2)] px-3 py-1.5 text-sm text-[var(--text)] [border-radius:8px] disabled:opacity-50"
+                >
+                  ☆ 把起点存为常用地点
+                </button>
+                <button
+                  type="button"
+                  disabled={!destination.trim()}
+                  onClick={() => { setSavePlaceTarget(savePlaceTarget === "destination" ? null : "destination"); setSavePlaceName(""); }}
+                  aria-label="把当前终点存为常用地点"
+                  className="bg-[var(--surface2)] px-3 py-1.5 text-sm text-[var(--text)] [border-radius:8px] disabled:opacity-50"
+                >
+                  ☆ 把终点存为常用地点
+                </button>
+              </div>
+              {savePlaceTarget && (
+                <div className="mt-3 border border-[var(--border)] bg-[var(--surface)] px-4 py-3 [border-radius:var(--radius)]">
+                  <p className="text-sm text-[var(--dim)]">
+                    给「{savePlaceTarget === "origin" ? origin.trim() : destination.trim()}」起个名字：
+                  </p>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    {["家", "公司", "学校", "车站"].map((n) => (
+                      <button
+                        key={n}
+                        type="button"
+                        onClick={() => setSavePlaceName(n)}
+                        aria-label={`用「${n}」作为常用地点名字`}
+                        className={`px-3 py-1 text-sm [border-radius:999px] ${savePlaceName === n ? "bg-[var(--accent)] font-bold text-[var(--accent-ink)]" : "bg-[var(--surface2)] text-[var(--text)]"}`}
+                      >
+                        {n}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="mt-2 flex gap-2">
+                    <input
+                      className={inputCls}
+                      value={savePlaceName}
+                      onChange={(e) => setSavePlaceName(e.target.value)}
+                      placeholder="输入名字，如：家、公司、孩子学校"
+                      aria-label="常用地点名字"
+                      autoComplete="off"
+                    />
+                    <button
+                      type="button"
+                      disabled={!savePlaceName.trim() || addPlace.isPending}
+                      onClick={() => {
+                        addPlace.mutate(
+                          {
+                            name: savePlaceName.trim(),
+                            address: savePlaceTarget === "origin" ? origin.trim() : destination.trim(),
+                          },
+                          { onSuccess: () => setSavePlaceTarget(null) },
+                        );
+                      }}
+                      className={submitCls}
+                    >
+                      保存
+                    </button>
+                    <button type="button" className={ghostBtnCls} onClick={() => setSavePlaceTarget(null)}>
+                      取消
+                    </button>
+                  </div>
+                  <p className="mt-1.5 text-xs text-[var(--dim)]">同名再保存会更新那个地点的地址。</p>
+                </div>
+              )}
+            </div>
+
             {rp.data && !rp.data.ok && <ErrorBox message={rp.data.error} onRetry={() => origin.trim() && destination.trim() && rp.mutate({ origin, destination })} />}
             {rp.isError && <ErrorBox message={`规划失败：${String(rp.error)}`} />}
-            {rp.data?.ok && <RoutePlansPanel data={rp.data} />}
+            {rp.data?.ok && (
+              <RoutePlansPanel
+                data={rp.data}
+                onStartTrip={startTrip}
+                starting={startTripMut.isPending}
+                hasActiveTrip={!!activeTrip}
+              />
+            )}
+            {startTripMut.isError && <ErrorBox message={`开始行程失败：${String(startTripMut.error)}`} />}
           </section>
         )}
 
@@ -879,7 +1051,90 @@ export function App() {
                 </ul>
               )}
             </div>
+
+            <div className="mt-6">
+              <SectionTitle>常用地点</SectionTitle>
+              {placeList.length === 0 ? (
+                <p className="mt-2 text-sm text-[var(--dim)]">
+                  还没有常用地点。在「规划」里输入地点后点「☆ 把起点/终点存为常用地点」，下次点一下名字就能填好。
+                </p>
+              ) : (
+                <ul className="mt-2 divide-y divide-[var(--border)] border-y border-[var(--border)] bg-[var(--surface)] [border-radius:var(--radius)]">
+                  {placeList.map((p) => (
+                    <li key={p.id} className="flex items-center gap-1 px-4 py-3">
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate text-base font-bold text-[var(--text)]">{p.name}</span>
+                        <span className="block truncate text-sm text-[var(--dim)]">{p.address}</span>
+                      </span>
+                      <button
+                        type="button"
+                        aria-label={`把${p.name}设为起点并去规划`}
+                        className="shrink-0 px-2 text-sm text-[var(--accent)]"
+                        onClick={() => { setOrigin(p.address); setTab("route"); }}
+                      >
+                        设起点
+                      </button>
+                      <button
+                        type="button"
+                        aria-label={`把${p.name}设为终点并去规划`}
+                        className="shrink-0 px-2 text-sm text-[var(--accent)]"
+                        onClick={() => { setDestination(p.address); setTab("route"); }}
+                      >
+                        设终点
+                      </button>
+                      <button
+                        type="button"
+                        aria-label={`删除常用地点 ${p.name}`}
+                        className="shrink-0 px-2 text-[var(--dim)]"
+                        onClick={() => removePlace.mutate(p.id)}
+                      >
+                        ×
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
           </section>
+        )}
+
+        {/* ============ 行程模式 ============ */}
+        {tab === "trip" && (
+          tripFinished ? (
+            <section aria-label="行程完成" className="mt-10 text-center">
+              <p className="text-3xl font-bold text-[var(--text)]">已到达目的地</p>
+              <p className="mt-2 text-sm text-[var(--dim)]">这趟行程结束了，辛苦啦。</p>
+              <button
+                type="button"
+                onClick={() => { setTripFinished(false); setTab("home"); }}
+                className="mt-6 bg-[var(--accent)] px-6 py-2.5 font-bold text-[var(--accent-ink)] [border-radius:8px]"
+              >
+                返回查车
+              </button>
+            </section>
+          ) : activeTrip ? (
+            <TripPanel
+              trip={activeTrip}
+              onAdvance={() => advanceTripMut.mutate()}
+              advancing={advanceTripMut.isPending}
+              advanceError={advanceTripMut.isError ? `推进失败：${String(advanceTripMut.error)}` : ""}
+              onEnd={() => endTripMut.mutate()}
+              ending={endTripMut.isPending}
+              onBack={() => setTab("home")}
+            />
+          ) : (
+            <section aria-label="行程模式" className="mt-10 text-center">
+              <p className="text-base text-[var(--text)]">现在没有进行中的行程</p>
+              <p className="mt-2 text-sm text-[var(--dim)]">在「规划」里查好路线，点方案上的「开始行程」就会进入行程模式。</p>
+              <button
+                type="button"
+                onClick={() => setTab("route")}
+                className="mt-5 bg-[var(--accent)] px-6 py-2.5 font-bold text-[var(--accent-ink)] [border-radius:8px]"
+              >
+                去规划路线
+              </button>
+            </section>
+          )
         )}
 
         {/* ============ 设置 ============ */}
@@ -1448,7 +1703,45 @@ function StationArrivalsPanel({
 
 const CIRCLES = "①②③④⑤⑥⑦⑧⑨⑩";
 
-function RoutePlansPanel({ data }: { data: RoutePlanResult }) {
+function PlaceChips({
+  places,
+  fieldLabel,
+  onPick,
+}: {
+  places: FavPlace[];
+  fieldLabel: string;
+  onPick: (p: FavPlace) => void;
+}) {
+  if (places.length === 0) return null;
+  return (
+    <div className="mb-2 flex flex-wrap gap-2">
+      {places.map((p) => (
+        <button
+          key={p.id}
+          type="button"
+          onClick={() => onPick(p)}
+          aria-label={`把常用地点${p.name}（${p.address}）填为${fieldLabel}`}
+          className="border border-[var(--border)] bg-[var(--surface)] px-3 py-1 text-sm text-[var(--text)] [border-radius:999px]"
+        >
+          {p.name}
+          <span className="ml-1 text-xs text-[var(--dim)]">{p.address}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function RoutePlansPanel({
+  data,
+  onStartTrip,
+  starting,
+  hasActiveTrip,
+}: {
+  data: RoutePlanResult;
+  onStartTrip: (plan: RoutePlan) => void;
+  starting: boolean;
+  hasActiveTrip: boolean;
+}) {
   return (
     <div className="mt-6 space-y-3">
       {data.plans.map((p, i) => {
@@ -1472,10 +1765,302 @@ function RoutePlansPanel({ data }: { data: RoutePlanResult }) {
                 </li>
               ))}
             </ol>
+            <button
+              type="button"
+              onClick={() => onStartTrip(p)}
+              disabled={starting}
+              aria-label={`按方案 ${i + 1} 开始行程`}
+              className="mt-3 w-full bg-[var(--accent)] px-4 py-2 font-bold text-[var(--accent-ink)] [border-radius:8px] disabled:opacity-50"
+            >
+              {starting ? "正在开始…" : "开始行程"}
+            </button>
+            {hasActiveTrip && (
+              <p className="mt-1.5 text-xs text-[var(--dim)]">开始新行程会替换当前进行中的行程。</p>
+            )}
           </article>
         );
       })}
     </div>
+  );
+}
+
+// ---------- 行程模式 ----------
+
+// 当前段的上车站实时：先只读服务端缓存快照（不调接口），有缓存先
+// 显示；真查询只在用户点「查实时 / 刷新」时发生，复用 queryLineRealtime
+// 的服务端缓存，不自动轮询。换乘段（isTransfer）用琥珀色醒目呈现。
+function TripRealtime({
+  city,
+  seg,
+  isTransfer,
+}: {
+  city: string;
+  seg: TripSegment;
+  isTransfer: boolean;
+}) {
+  const snapshot = useQuery({
+    queryKey: ["tripRtSnapshot", city, seg.name, seg.departure],
+    queryFn: () =>
+      api.getBoardSnapshot({
+        city,
+        items: [{ id: 1, kind: "lineStation", value: seg.name, label: seg.departure }],
+      }),
+  });
+  const rtM = useMutation({
+    mutationFn: () =>
+      api.queryLineRealtime({ line: seg.name, station: seg.departure, city }),
+  });
+  const data: RealtimeResult | null = rtM.data?.ok
+    ? rtM.data
+    : (snapshot.data?.entries[0]?.realtime ?? null);
+  const error =
+    (rtM.data && !rtM.data.ok ? rtM.data.error : "") ||
+    (rtM.isError ? `查询失败：${String(rtM.error)}` : "");
+  const dirs = data
+    ? seg.terminal
+      ? data.directions.filter((d) => d.terminal === seg.terminal).length > 0
+        ? data.directions.filter((d) => d.terminal === seg.terminal)
+        : data.directions
+      : data.directions
+    : [];
+
+  return (
+    <div
+      className={`mt-3 px-3 py-3 [border-radius:8px] ${
+        isTransfer
+          ? "border border-[var(--amber)] bg-[var(--amber-bg)]"
+          : "bg-[var(--surface2)]"
+      }`}
+    >
+      <div className="flex items-center gap-2">
+        <p className={`flex-1 text-sm font-bold ${isTransfer ? "text-[var(--amber)]" : "text-[var(--text)]"}`}>
+          {isTransfer ? "换乘车实时 · 别错过" : "这班车实时"} · 在{seg.departure}上车
+        </p>
+        <button
+          type="button"
+          onClick={() => rtM.mutate()}
+          disabled={rtM.isPending}
+          aria-label={`刷新 ${seg.name} 在 ${seg.departure} 的实时到站`}
+          className="shrink-0 bg-[var(--surface)] px-3 text-sm font-medium text-[var(--text)] [border-radius:8px] disabled:opacity-50"
+        >
+          {rtM.isPending ? "查询中…" : data ? "刷新" : "查实时"}
+        </button>
+      </div>
+      {error && <p className="mt-2 text-sm text-[var(--danger)]">{error}</p>}
+      {!data && !error && (
+        <p className="mt-2 text-sm text-[var(--dim)]">
+          {snapshot.isPending ? "正在看有没有缓存…" : "暂时没有缓存数据，点「查实时」看这班车到哪了。"}
+        </p>
+      )}
+      {data && (
+        <>
+          <ul className="mt-2 space-y-1.5">
+            {dirs.map((d) => {
+              const next = d.buses[0];
+              return (
+                <li key={d.direction} className="flex items-baseline justify-between gap-3">
+                  <span className="min-w-0 truncate text-sm text-[var(--dim)]">
+                    开往 {d.terminal || "—"}
+                  </span>
+                  <span className="shrink-0 text-xl font-bold text-[var(--text)]">
+                    {d.error ? "查询失败" : next ? boardHeadline(next) : "暂无车"}
+                  </span>
+                </li>
+              );
+            })}
+          </ul>
+          <p className="mt-1.5 text-xs text-[var(--dim)]">
+            数据时间 {data.queriedAt}
+            {data.cached ? " · 缓存" : ""} · 不自动刷新，点刷新才查
+          </p>
+        </>
+      )}
+    </div>
+  );
+}
+
+function TripPanel({
+  trip,
+  onAdvance,
+  advancing,
+  advanceError,
+  onEnd,
+  ending,
+  onBack,
+}: {
+  trip: ActiveTrip;
+  onAdvance: () => void;
+  advancing: boolean;
+  advanceError: string;
+  onEnd: () => void;
+  ending: boolean;
+  onBack: () => void;
+}) {
+  const [confirmEnd, setConfirmEnd] = useState(false);
+  const current = trip.segments[trip.currentIndex];
+  if (!current) return null;
+  const isLast = trip.currentIndex === trip.segments.length - 1;
+  const isRide = current.type !== "步行";
+  const advanceLabel = !isRide
+    ? isLast
+      ? "已走完 · 完成行程"
+      : "已走完这段步行"
+    : trip.phase === "waiting"
+      ? "已上车"
+      : isLast
+        ? `已下车 · 完成行程`
+        : `已下车（到达 ${current.arrival}）`;
+
+  return (
+    <section aria-label="行程模式" className="mt-5">
+      <button type="button" onClick={onBack} className="text-sm font-medium text-[var(--accent)]">
+        ‹ 返回查车（行程不会丢）
+      </button>
+      <h2 className="mt-3 text-xl font-bold text-[var(--text)]">
+        {trip.origin} → {trip.destination}
+      </h2>
+      <p className="mt-1 text-xs text-[var(--dim)]">
+        第 {trip.currentIndex + 1} / 共 {trip.segments.length} 段 · 进度保存在服务端，关掉页面再打开能接着走
+      </p>
+
+      <ol className="mt-5 space-y-3">
+        {trip.segments.map((seg, i) => {
+          const done = i < trip.currentIndex;
+          const isCurrent = i === trip.currentIndex;
+          const ride = seg.type !== "步行";
+          return (
+            <li
+              key={i}
+              className={`border px-4 py-3 [border-radius:var(--radius)] ${
+                isCurrent
+                  ? "border-[var(--accent)] bg-[var(--surface)]"
+                  : "border-[var(--border)] bg-[var(--surface)]"
+              } ${done ? "opacity-60" : ""}`}
+            >
+              <div className="flex items-baseline gap-2">
+                <span className={`shrink-0 text-sm font-bold ${isCurrent ? "text-[var(--accent)]" : "text-[var(--dim)]"}`}>
+                  {done ? "✓" : `${i + 1}`}
+                </span>
+                {ride ? (
+                  <LineBadge name={seg.name} />
+                ) : (
+                  <span className="inline-flex shrink-0 items-center bg-[var(--surface2)] px-2 py-0.5 text-sm font-bold text-[var(--text)] [border-radius:6px]">
+                    步行
+                  </span>
+                )}
+                <span className="min-w-0 flex-1 truncate text-base text-[var(--text)]">
+                  {ride
+                    ? `${seg.departure} → ${seg.arrival}`
+                    : seg.walkDistance
+                      ? `步行约 ${seg.walkDistance} 米${seg.arrival ? `到 ${seg.arrival}` : ""}`
+                      : "步行一段"}
+                </span>
+                {ride && seg.stopCount != null && (
+                  <span className="shrink-0 text-xs text-[var(--dim)]">共 {seg.stopCount} 站</span>
+                )}
+                {isCurrent && (
+                  <span className="shrink-0 text-xs font-bold text-[var(--accent)]">
+                    {ride && trip.phase === "riding" ? "已上车" : "当前段"}
+                  </span>
+                )}
+              </div>
+
+              {isCurrent && ride && (
+                <>
+                  {trip.phase === "riding" && seg.stopCount != null && (
+                    <p className="mt-3 border border-[var(--amber)] bg-[var(--amber-bg)] px-3 py-2 text-base font-bold text-[var(--text)] [border-radius:8px]">
+                      已上车 · 还剩 {seg.stopCount} 站到「{seg.arrival}」下车，别坐过站
+                      <span className="block text-xs font-normal text-[var(--dim)]">按站点序计算的站数，不是车辆实时位置</span>
+                    </p>
+                  )}
+                  <TripRealtime
+                    city={trip.city}
+                    seg={seg}
+                    isTransfer={trip.currentIndex > 0}
+                  />
+                  {seg.stops.length > 0 ? (
+                    <ol className="mt-3 border-t border-[var(--border)] pt-2">
+                      {seg.stops.map((stop, j) => {
+                        const isFirst = j === 0;
+                        const isStopLast = j === seg.stops.length - 1;
+                        return (
+                          <li key={`${stop}-${j}`} className="flex items-center gap-3 px-1 py-1.5">
+                            <span
+                              className={`h-2 w-2 shrink-0 rounded-full ${
+                                isFirst
+                                  ? "bg-[var(--accent)]"
+                                  : isStopLast
+                                    ? "bg-[var(--amber)]"
+                                    : "bg-[var(--border)]"
+                              }`}
+                            />
+                            <span className={`flex-1 text-base ${isFirst || isStopLast ? "font-bold text-[var(--text)]" : "text-[var(--dim)]"}`}>
+                              {stop}
+                            </span>
+                            {isFirst && <span className="shrink-0 text-xs font-bold text-[var(--accent)]">上车站</span>}
+                            {isStopLast && <span className="shrink-0 text-xs font-bold text-[var(--amber)]">下车站</span>}
+                          </li>
+                        );
+                      })}
+                    </ol>
+                  ) : (
+                    <p className="mt-2 text-xs text-[var(--dim)]">
+                      这条线没取到站点序，站数未知；认准在「{seg.arrival}」下车。
+                    </p>
+                  )}
+                </>
+              )}
+              {isCurrent && !ride && (
+                <p className="mt-2 text-sm text-[var(--dim)]">
+                  跟着导航走到{seg.arrival ? `「${seg.arrival}」` : "下一段上车点"}，走完点下面的按钮。
+                </p>
+              )}
+            </li>
+          );
+        })}
+      </ol>
+
+      {advanceError && <ErrorBox message={advanceError} />}
+      <button
+        type="button"
+        onClick={onAdvance}
+        disabled={advancing}
+        aria-label={advanceLabel}
+        className="mt-5 w-full bg-[var(--accent)] px-5 py-3 text-lg font-bold text-[var(--accent-ink)] [border-radius:8px] disabled:opacity-50"
+      >
+        {advancing ? "记录中…" : advanceLabel}
+      </button>
+
+      {confirmEnd ? (
+        <div className="mt-4 flex items-center gap-2">
+          <p className="flex-1 text-sm text-[var(--text)]">确定结束这次行程？进度会清掉。</p>
+          <button
+            type="button"
+            onClick={onEnd}
+            disabled={ending}
+            className="shrink-0 px-3 font-bold text-[var(--danger)] [border-radius:8px] disabled:opacity-50"
+          >
+            {ending ? "结束中…" : "确认结束"}
+          </button>
+          <button
+            type="button"
+            onClick={() => setConfirmEnd(false)}
+            className="shrink-0 bg-[var(--surface2)] px-3 text-sm font-medium text-[var(--text)] [border-radius:8px]"
+          >
+            继续行程
+          </button>
+        </div>
+      ) : (
+        <button
+          type="button"
+          onClick={() => setConfirmEnd(true)}
+          aria-label="结束行程"
+          className="mt-4 w-full px-3 py-2 text-sm text-[var(--dim)]"
+        >
+          结束行程（放弃这次出行）
+        </button>
+      )}
+    </section>
   );
 }
 

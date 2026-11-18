@@ -735,6 +735,45 @@ const favoriteRoutesResponse = z.object({
   ),
 });
 
+const favoritePlacesResponse = z.object({
+  places: z.array(
+    z.object({
+      id: z.number(),
+      name: z.string(),
+      address: z.string(),
+    }),
+  ),
+});
+
+// 行程段：规划方案的段富化后的样子。stops 是按行进方向切出的
+// 上车站→下车站站点序（含两端），拿不到站点序时为空数组、stopCount
+// 为 null，页面如实显示「站数未知」，不编造。
+const tripSegmentSchema = z.object({
+  type: z.string(),
+  name: z.string(),
+  departure: z.string(),
+  arrival: z.string(),
+  walkDistance: z.string(),
+  stops: z.array(z.string()),
+  stopCount: z.number().nullable(),
+  terminal: z.string(),
+});
+type TripSegment = z.infer<typeof tripSegmentSchema>;
+
+const activeTripResponse = z.object({
+  trip: z
+    .object({
+      city: z.string(),
+      origin: z.string(),
+      destination: z.string(),
+      segments: z.array(tripSegmentSchema),
+      currentIndex: z.number(),
+      phase: z.enum(["waiting", "riding"]),
+      finished: z.boolean(),
+    })
+    .nullable(),
+});
+
 const metroLinesResponse = z.object({
   ok: z.boolean(),
   error: z.string(),
@@ -825,6 +864,93 @@ async function listFavoriteRoutes(
       label: r.label,
     })),
   };
+}
+
+async function listFavoritePlaces(
+  ctx: Ctx,
+  city: string,
+): Promise<z.infer<typeof favoritePlacesResponse>> {
+  const db = ctx.db<typeof schema>();
+  const rows = await db
+    .select()
+    .from(schema.favoritePlaces)
+    .where(eq(schema.favoritePlaces.city, city))
+    .orderBy(desc(schema.favoritePlaces.id))
+    .limit(50);
+  return {
+    places: rows.map((r) => ({ id: r.id, name: r.name, address: r.address })),
+  };
+}
+
+async function loadActiveTrip(
+  ctx: Ctx,
+): Promise<z.infer<typeof activeTripResponse>> {
+  const db = ctx.db<typeof schema>();
+  const rows = await db
+    .select()
+    .from(schema.activeTrip)
+    .where(eq(schema.activeTrip.id, 1))
+    .limit(1);
+  const row = rows[0];
+  if (!row) return { trip: null };
+  let segments: TripSegment[] = [];
+  try {
+    const parsed: unknown = JSON.parse(row.segmentsJson || "[]");
+    const checked = z.array(tripSegmentSchema).safeParse(parsed);
+    if (checked.success) segments = checked.data;
+  } catch {
+    segments = [];
+  }
+  if (segments.length === 0) return { trip: null };
+  return {
+    trip: {
+      city: row.city,
+      origin: row.origin,
+      destination: row.destination,
+      segments,
+      currentIndex: Math.min(Math.max(row.currentIndex, 0), segments.length - 1),
+      phase: row.phase === "riding" ? "riding" : "waiting",
+      finished: false,
+    },
+  };
+}
+
+/**
+ * 给乘车段富化站点序：先只读 12 小时站点序缓存，两个方向都没命中才
+ * 真调线路详情接口（先试方向 1，不含上下车站再试方向 2）。找到包含
+ * 上车站与下车站（顺序不限，反向即倒序）的方向后，切出两站之间的
+ * 站序（按行进方向排列）。找不到就留空，页面如实显示站数未知。
+ */
+async function enrichRideSegment(
+  ctx: Ctx,
+  city: string,
+  seg: TripSegment,
+): Promise<TripSegment> {
+  const dep = seg.departure.trim();
+  const arr = seg.arrival.trim();
+  if (!dep || !arr || !seg.name) return seg;
+  const sliceFrom = (stops: string[] | null): TripSegment | null => {
+    if (!stops) return null;
+    const i = stops.indexOf(dep);
+    const j = stops.indexOf(arr);
+    if (i < 0 || j < 0 || i === j) return null;
+    const slice = i < j ? stops.slice(i, j + 1) : stops.slice(j, i + 1).reverse();
+    return {
+      ...seg,
+      stops: slice,
+      stopCount: slice.length - 1,
+      terminal: i < j ? (stops[stops.length - 1] ?? "") : (stops[0] ?? ""),
+    };
+  };
+  for (const dir of [1, 2]) {
+    const hit = sliceFrom(await getLineStops(ctx, city, seg.name, dir, false));
+    if (hit) return hit;
+  }
+  for (const dir of [1, 2]) {
+    const hit = sliceFrom(await getLineStops(ctx, city, seg.name, dir, true));
+    if (hit) return hit;
+  }
+  return seg;
 }
 
 async function listFavorites(
@@ -1485,6 +1611,197 @@ export const Actions = {
         .delete(schema.favoriteRoutes)
         .where(eq(schema.favoriteRoutes.id, args.id));
       return listFavoriteRoutes(ctx, cityOf(args.city));
+    },
+  }),
+
+  listFavoritePlaces: defineAction({
+    description: "列出用户在某城市存的常用地点（名称+地点关键词）。city 缺省为厦门。",
+    request: z.object({ city: z.string().max(20).optional() }),
+    response: favoritePlacesResponse,
+    async handler(ctx, args): Promise<z.infer<typeof favoritePlacesResponse>> {
+      return listFavoritePlaces(ctx, cityOf(args.city));
+    },
+  }),
+
+  addFavoritePlace: defineAction({
+    description:
+      "把一个地点存为某城市的常用地点：name 是用户起的名字（如家、公司），address 是规划时用的地点关键词。同城市同名自动更新地址，同名同址不重复存。city 缺省为厦门。",
+    request: z.object({
+      name: z.string().min(1).max(20),
+      address: z.string().min(1).max(60),
+      city: z.string().max(20).optional(),
+    }),
+    response: favoritePlacesResponse,
+    async handler(ctx, args): Promise<z.infer<typeof favoritePlacesResponse>> {
+      const city = cityOf(args.city);
+      const db = ctx.db<typeof schema>();
+      const name = args.name.trim();
+      const address = args.address.trim();
+      const sameName = await db
+        .select()
+        .from(schema.favoritePlaces)
+        .where(
+          and(
+            eq(schema.favoritePlaces.city, city),
+            eq(schema.favoritePlaces.name, name),
+          ),
+        )
+        .limit(1);
+      if (sameName[0]) {
+        await db
+          .update(schema.favoritePlaces)
+          .set({ address })
+          .where(eq(schema.favoritePlaces.id, sameName[0].id));
+      } else {
+        await db.insert(schema.favoritePlaces).values({ city, name, address });
+      }
+      return listFavoritePlaces(ctx, city);
+    },
+  }),
+
+  removeFavoritePlace: defineAction({
+    description: "删除一个常用地点，返回该城市剩余的常用地点列表。",
+    request: z.object({
+      id: z.number().int().positive(),
+      city: z.string().max(20).optional(),
+    }),
+    response: favoritePlacesResponse,
+    async handler(ctx, args): Promise<z.infer<typeof favoritePlacesResponse>> {
+      const db = ctx.db<typeof schema>();
+      await db
+        .delete(schema.favoritePlaces)
+        .where(eq(schema.favoritePlaces.id, args.id));
+      return listFavoritePlaces(ctx, cityOf(args.city));
+    },
+  }),
+
+  getActiveTrip: defineAction({
+    description:
+      "读取当前进行中的行程（所选方案各段、当前进行到第几段、是否已上车）；没有进行中行程时 trip 为 null。关掉页面再打开靠它续上行程。",
+    request: z.object({}),
+    response: activeTripResponse,
+    async handler(ctx): Promise<z.infer<typeof activeTripResponse>> {
+      return loadActiveTrip(ctx);
+    },
+  }),
+
+  startTrip: defineAction({
+    description:
+      "开始一段行程：把所选规划方案的各段存为唯一进行中行程（已有进行中行程会被替换），并为每个乘车段按站点序算出上车站→下车站之间的站序与站数（防坐过站用）。当前段从第一段开始。",
+    request: z.object({
+      origin: z.string().min(1).max(60),
+      destination: z.string().min(1).max(60),
+      city: z.string().max(20).optional(),
+      segments: z
+        .array(
+          z.object({
+            type: z.string().max(20),
+            name: z.string().max(60),
+            departure: z.string().max(60),
+            arrival: z.string().max(60),
+            walkDistance: z.string().max(20),
+          }),
+        )
+        .min(1)
+        .max(20),
+    }),
+    response: activeTripResponse,
+    privileged: [privileged.apizeroCall],
+    async handler(ctx, args): Promise<z.infer<typeof activeTripResponse>> {
+      const city = cityOf(args.city);
+      const segments: TripSegment[] = [];
+      for (const s of args.segments) {
+        const base: TripSegment = {
+          type: s.type,
+          name: s.name,
+          departure: s.departure,
+          arrival: s.arrival,
+          walkDistance: s.walkDistance,
+          stops: [],
+          stopCount: null,
+          terminal: "",
+        };
+        segments.push(
+          s.type === "步行" ? base : await enrichRideSegment(ctx, city, base),
+        );
+      }
+      const db = ctx.db<typeof schema>();
+      const now = new Date();
+      await db
+        .insert(schema.activeTrip)
+        .values({
+          id: 1,
+          city,
+          origin: args.origin.trim(),
+          destination: args.destination.trim(),
+          segmentsJson: JSON.stringify(segments),
+          currentIndex: 0,
+          phase: "waiting",
+          createdAt: now,
+          updatedAt: now,
+        })
+        .onConflictDoUpdate({
+          target: schema.activeTrip.id,
+          set: {
+            city,
+            origin: args.origin.trim(),
+            destination: args.destination.trim(),
+            segmentsJson: JSON.stringify(segments),
+            currentIndex: 0,
+            phase: "waiting",
+            updatedAt: now,
+          },
+        });
+      return loadActiveTrip(ctx);
+    },
+  }),
+
+  advanceTrip: defineAction({
+    description:
+      "推进行程一步：乘车段先从未上车变已上车、再变已下车并进入下一段；步行段直接进入下一段。最后一段完成后行程结束并清除进行中状态，返回值里 trip.finished=true 表示刚完成（行程数据仍附带返回供前端展示到达页）。",
+    request: z.object({}),
+    response: activeTripResponse,
+    async handler(ctx): Promise<z.infer<typeof activeTripResponse>> {
+      const db = ctx.db<typeof schema>();
+      const cur = await loadActiveTrip(ctx);
+      if (!cur.trip) return { trip: null };
+      const { segments, currentIndex, phase } = cur.trip;
+      const seg = segments[currentIndex];
+      if (!seg) {
+        await db.delete(schema.activeTrip).where(eq(schema.activeTrip.id, 1));
+        return { trip: null };
+      }
+      const isRide = seg.type !== "步行";
+      if (isRide && phase === "waiting") {
+        await db
+          .update(schema.activeTrip)
+          .set({ phase: "riding", updatedAt: new Date() })
+          .where(eq(schema.activeTrip.id, 1));
+        return loadActiveTrip(ctx);
+      }
+      const next = currentIndex + 1;
+      if (next >= segments.length) {
+        await db.delete(schema.activeTrip).where(eq(schema.activeTrip.id, 1));
+        return {
+          trip: { ...cur.trip, currentIndex, phase, finished: true },
+        };
+      }
+      await db
+        .update(schema.activeTrip)
+        .set({ currentIndex: next, phase: "waiting", updatedAt: new Date() })
+        .where(eq(schema.activeTrip.id, 1));
+      return loadActiveTrip(ctx);
+    },
+  }),
+
+  endTrip: defineAction({
+    description: "放弃并清除当前进行中的行程。",
+    request: z.object({}),
+    response: activeTripResponse,
+    async handler(ctx): Promise<z.infer<typeof activeTripResponse>> {
+      const db = ctx.db<typeof schema>();
+      await db.delete(schema.activeTrip).where(eq(schema.activeTrip.id, 1));
+      return { trip: null };
     },
   }),
 

@@ -36,6 +36,13 @@
       "when": 1794961592194,
       "tag": "0005_settings_table",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1794962126247,
+      "tag": "0006_favorite_places_and_active_trip",
+      "breakpoints": true
     }
   ]
 }

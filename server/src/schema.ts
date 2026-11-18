@@ -41,3 +41,36 @@ export const favoriteRoutes = sqliteTable("favorite_routes", {
     .notNull()
     .$defaultFn(() => new Date()),
 });
+
+// 常用地点：名称（家/公司/自定义）+ 地点关键词，按城市隔离。
+export const favoritePlaces = sqliteTable("favorite_places", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  city: text("city").notNull().default("厦门"),
+  name: text("name").notNull(),
+  address: text("address").notNull(),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+// 进行中的行程：全表只存一行（id 固定 1），同时只能有一个进行中行程。
+// segments_json 存所选方案各段的富化信息（线路/上车/下车/站点序切片），
+// current_index 是当前段下标，phase 为 waiting（未上车/步行未走）或
+// riding（已上车、未下车）。行程完成或放弃即删行。
+export const activeTrip = sqliteTable("active_trip", {
+  id: integer("id").primaryKey(),
+  city: text("city").notNull().default("厦门"),
+  origin: text("origin").notNull(),
+  destination: text("destination").notNull(),
+  segmentsJson: text("segments_json").notNull(),
+  currentIndex: integer("current_index").notNull().default(0),
+  phase: text("phase", { enum: ["waiting", "riding"] })
+    .notNull()
+    .default("waiting"),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
