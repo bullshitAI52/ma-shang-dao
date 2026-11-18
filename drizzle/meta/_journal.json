@@ -71,6 +71,13 @@
       "when": 1794970166064,
       "tag": "0010_line_pick_cache_table",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1794970647485,
+      "tag": "0011_canvas_templates_table",
+      "breakpoints": true
     }
   ]
 }

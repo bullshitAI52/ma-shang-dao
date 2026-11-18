@@ -1070,6 +1070,53 @@ async function listCanvas(
   };
 }
 
+// ---------- 模块库（画布模块模板，按城市隔离，只存配置） ----------
+
+const canvasTemplateItem = z.object({
+  id: z.number(),
+  kind: z.string(),
+  line: z.string(),
+  station: z.string(),
+  direction: z.number(),
+  terminal: z.string(),
+  text: z.string(),
+  note: z.string(),
+});
+
+const canvasTemplatesResponse = z.object({
+  templates: z.array(canvasTemplateItem),
+});
+
+const saveCanvasTemplateResponse = z.object({
+  templates: z.array(canvasTemplateItem),
+  alreadyInLibrary: z.boolean(),
+});
+
+async function listCanvasTemplates(
+  ctx: Ctx,
+  city: string,
+): Promise<z.infer<typeof canvasTemplatesResponse>> {
+  const db = ctx.db<typeof schema>();
+  const rows = await db
+    .select()
+    .from(schema.canvasTemplates)
+    .where(eq(schema.canvasTemplates.city, city))
+    .orderBy(desc(schema.canvasTemplates.id))
+    .limit(200);
+  return {
+    templates: rows.map((t) => ({
+      id: t.id,
+      kind: t.kind,
+      line: t.line,
+      station: t.station,
+      direction: t.direction,
+      terminal: t.terminal,
+      text: t.text,
+      note: t.note,
+    })),
+  };
+}
+
 const CANVAS_SEED_KEY_PREFIX = "canvas_seeded:";
 
 /**
@@ -2533,6 +2580,97 @@ export const Actions = {
         .delete(schema.canvasLinks)
         .where(eq(schema.canvasLinks.id, args.id));
       return listCanvas(ctx, city);
+    },
+  }),
+
+  getCanvasTemplates: defineAction({
+    description:
+      "读取某城市模块库的全部模板（用户存下来的配好模块配置：到站卡的站名/线路/方向/终点站/备注，或文本卡的文字），按存入时间倒序。只含配置、不含实时数据。city 缺省为厦门。",
+    request: z.object({ city: z.string().max(20).optional() }),
+    response: canvasTemplatesResponse,
+    async handler(ctx, args): Promise<z.infer<typeof canvasTemplatesResponse>> {
+      const city = cityOf(args.city);
+      return listCanvasTemplates(ctx, city);
+    },
+  }),
+
+  saveCanvasTemplate: defineAction({
+    description:
+      "把一个配好的画布模块存入模块库：kind=station 存 line/station/direction/terminal/note，kind=text 存 text/note。同一城市下配置完全相同（类型+线路+站名+方向+终点站+文本+备注都一样）的模板已存在时不重复存，返回 alreadyInLibrary=true 且列表不变。返回该城市模块库全量。city 缺省为厦门。",
+    request: z.object({
+      kind: z.enum(["station", "text"]),
+      line: z.string().max(20).optional(),
+      station: z.string().max(40).optional(),
+      direction: z.number().int().min(0).max(2).optional(),
+      terminal: z.string().max(40).optional(),
+      text: z.string().max(200).optional(),
+      note: z.string().max(100).optional(),
+      city: z.string().max(20).optional(),
+    }),
+    response: saveCanvasTemplateResponse,
+    async handler(
+      ctx,
+      args,
+    ): Promise<z.infer<typeof saveCanvasTemplateResponse>> {
+      const city = cityOf(args.city);
+      const db = ctx.db<typeof schema>();
+      const cfg = {
+        city,
+        kind: args.kind,
+        line:
+          args.kind === "station" ? normalizeLine(args.line ?? "") : "",
+        station: args.kind === "station" ? (args.station ?? "").trim() : "",
+        direction: args.kind === "station" ? (args.direction ?? 0) : 0,
+        terminal: args.kind === "station" ? (args.terminal ?? "").trim() : "",
+        text: args.kind === "text" ? (args.text ?? "").trim() : "",
+        note: (args.note ?? "").trim(),
+      };
+      const dup = await db
+        .select({ id: schema.canvasTemplates.id })
+        .from(schema.canvasTemplates)
+        .where(
+          and(
+            eq(schema.canvasTemplates.city, cfg.city),
+            eq(schema.canvasTemplates.kind, cfg.kind),
+            eq(schema.canvasTemplates.line, cfg.line),
+            eq(schema.canvasTemplates.station, cfg.station),
+            eq(schema.canvasTemplates.direction, cfg.direction),
+            eq(schema.canvasTemplates.terminal, cfg.terminal),
+            eq(schema.canvasTemplates.text, cfg.text),
+            eq(schema.canvasTemplates.note, cfg.note),
+          ),
+        )
+        .limit(1);
+      if (dup.length > 0) {
+        const list = await listCanvasTemplates(ctx, city);
+        return { ...list, alreadyInLibrary: true };
+      }
+      await db.insert(schema.canvasTemplates).values(cfg);
+      const list = await listCanvasTemplates(ctx, city);
+      return { ...list, alreadyInLibrary: false };
+    },
+  }),
+
+  removeCanvasTemplate: defineAction({
+    description:
+      "从模块库删除一个模板（只删模板本身，已经放到画布上的副本不受影响）。返回该城市模块库全量。city 缺省为厦门。",
+    request: z.object({
+      id: z.number().int().positive(),
+      city: z.string().max(20).optional(),
+    }),
+    response: canvasTemplatesResponse,
+    async handler(ctx, args): Promise<z.infer<typeof canvasTemplatesResponse>> {
+      const city = cityOf(args.city);
+      const db = ctx.db<typeof schema>();
+      await db
+        .delete(schema.canvasTemplates)
+        .where(
+          and(
+            eq(schema.canvasTemplates.id, args.id),
+            eq(schema.canvasTemplates.city, city),
+          ),
+        );
+      return listCanvasTemplates(ctx, city);
     },
   }),
 

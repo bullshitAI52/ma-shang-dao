@@ -112,6 +112,26 @@ export const canvasLinks = sqliteTable("canvas_links", {
     .$defaultFn(() => new Date()),
 });
 
+// 模块库：用户把配好的画布模块存成的模板（只存配置——类型/站名/
+// 线路/方向/终点站/文本/备注，不存实时数据、不存位置），按城市隔
+// 离。调用时按配置在画布上放一份独立副本，改/删副本不影响模板，
+// 删模板也不影响已放出的副本。同一城市同一配置只存一条（服务端
+// 保存时去重）。
+export const canvasTemplates = sqliteTable("canvas_templates", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  city: text("city").notNull().default("厦门"),
+  kind: text("kind", { enum: ["station", "text"] }).notNull(),
+  line: text("line").notNull().default(""),
+  station: text("station").notNull().default(""),
+  direction: integer("direction").notNull().default(0),
+  terminal: text("terminal").notNull().default(""),
+  text: text("text").notNull().default(""),
+  note: text("note").notNull().default(""),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
 // 线路点选缓存：按「城市 + 线路」沉淀这条线已知的终点站与站序，供
 // 画布到站卡点选方向/站名用（尽量不打字、且取选项不消耗 apizero 额
 // 度）。来源：查线路详情/站序时顺带记、实时查询结果自带的终点站、

@@ -25,6 +25,7 @@ type BusInfo = RealtimeResult["directions"][number]["buses"][number];
 type BoardEntry = ApiResponse<typeof api, "getBoardSnapshot">["entries"][number];
 type CanvasData = ApiResponse<typeof api, "getCanvas">;
 type CanvasModule = CanvasData["modules"][number];
+type CanvasTemplate = ApiResponse<typeof api, "getCanvasTemplates">["templates"][number];
 
 // ---------- 城市切换 ----------
 // 默认厦门（保持原有体验与收藏）；所选城市存 localStorage，刷新不丢。
@@ -3071,6 +3072,7 @@ function CanvasView({
       direction?: number;
       terminal?: string;
       text?: string;
+      note?: string;
       x: number;
       y: number;
     }) => api.addCanvasModule({ ...args, city }),
@@ -3104,6 +3106,60 @@ function CanvasView({
     mutationFn: (id: number) => api.removeCanvasLink({ id, city }),
     onSuccess: applyCanvas,
   });
+
+  // 模块库：配好的模块存成模板（只存配置、按城市隔离），之后在
+  // 「＋ 加模块」面板里点一下就在画布空位放一份独立副本。副本与
+  // 模板互不影响：改/删副本不动模板，删模板不动已放出的副本。
+  const templatesQ = useQuery({
+    queryKey: ["canvasTemplates", city],
+    queryFn: () => api.getCanvasTemplates({ city }),
+  });
+  const templates = templatesQ.data?.templates ?? [];
+  const applyTemplates = (data: { templates: CanvasTemplate[] }) =>
+    queryClient.setQueryData(["canvasTemplates", city], data);
+  const [templateFlash, setTemplateFlash] = useState("");
+  useEffect(() => {
+    if (!templateFlash) return;
+    const t = setTimeout(() => setTemplateFlash(""), 2600);
+    return () => clearTimeout(t);
+  }, [templateFlash]);
+  const saveTemplateMut = useMutation({
+    mutationFn: (m: CanvasModule) =>
+      api.saveCanvasTemplate({
+        city,
+        kind: m.kind === "text" ? "text" : "station",
+        line: m.line,
+        station: m.station,
+        direction: m.direction,
+        terminal: m.terminal,
+        text: m.text,
+        note: m.note,
+      }),
+    onSuccess: (data) => {
+      applyTemplates(data);
+      setTemplateFlash(
+        data.alreadyInLibrary
+          ? "这个模块已经在模块库里了，没有重复存"
+          : "已存入模块库，下次在「＋ 加模块」里点一下就能放出来",
+      );
+    },
+    onError: () => setTemplateFlash("存入模块库失败，再试一次"),
+  });
+  const removeTemplateMut = useMutation({
+    mutationFn: (id: number) => api.removeCanvasTemplate({ id, city }),
+    onSuccess: applyTemplates,
+  });
+  const [confirmTemplateId, setConfirmTemplateId] = useState<number | null>(null);
+  const templateSummary = (t: CanvasTemplate) =>
+    t.kind === "text"
+      ? `文本卡：${t.text || "（空）"}`
+      : `${t.station || "未填站名"} · ${t.line || "未填线路"}${
+          t.terminal
+            ? ` · 往${t.terminal}`
+            : t.direction
+              ? ` · 方向${t.direction}`
+              : ""
+        }`;
 
   // 视口（平移 + 缩放）
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -3354,6 +3410,24 @@ function CanvasView({
     closeAdd();
   };
 
+  // 从模块库调用：按模板配置在当前视口空位放一份独立副本，
+  // 副本之后与普通模块完全一样（拖动/连线/开始停止/整删），
+  // 改它、删它都不影响库里的模板。
+  const placeTemplate = (t: CanvasTemplate) => {
+    const pos = centerWorldPos();
+    addModuleMut.mutate({
+      kind: t.kind === "text" ? "text" : "station",
+      line: t.line,
+      station: t.station,
+      direction: t.direction,
+      terminal: t.terminal,
+      text: t.text,
+      note: t.note,
+      ...pos,
+    });
+    closeAdd();
+  };
+
   const modById = (id: number) => modules.find((m) => m.id === id);
 
   return (
@@ -3431,6 +3505,12 @@ function CanvasView({
           {linkFrom === null
             ? "点一个模块作起点，再点另一个模块，连线就画好了。（平时直接按住模块右侧的蓝点拖到另一个模块上也能连线）"
             : "已选起点，再点另一个模块完成连线；点起点本身取消。点画布上的线可以删掉它。"}
+        </p>
+      )}
+
+      {templateFlash && (
+        <p className="mt-2 text-sm font-medium text-[var(--accent)]" role="status">
+          {templateFlash}
         </p>
       )}
 
@@ -3589,6 +3669,71 @@ function CanvasView({
               )}
             </div>
           )}
+          <div className="mt-4 border-t border-[var(--border)] pt-3">
+            <p className="text-sm font-bold text-[var(--text)]">我的模块库</p>
+            {templatesQ.isLoading ? (
+              <p className="mt-1.5 text-sm text-[var(--dim)]">正在打开模块库…</p>
+            ) : templatesQ.isError ? (
+              <p className="mt-1.5 text-sm text-[var(--danger)]">
+                模块库打开失败，点「＋ 加模块」收起再打开试试。
+              </p>
+            ) : templates.length === 0 ? (
+              <p className="mt-1.5 text-sm leading-relaxed text-[var(--dim)]">
+                还没有存过的模块。在画布上把一张卡配好，点卡上的「存库」，它就存到这里；下次点这里任意一条，直接在画布上放一份，不用再填一遍。
+              </p>
+            ) : (
+              <ul className="mt-2 space-y-1.5">
+                {templates.map((t) => (
+                  <li key={t.id} className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => placeTemplate(t)}
+                      disabled={addModuleMut.isPending}
+                      aria-label={`把模块「${templateSummary(t)}」放到画布上`}
+                      className="min-w-0 flex-1 truncate bg-[var(--surface2)] px-3 py-2 text-left text-sm font-medium text-[var(--text)] [border-radius:8px] disabled:opacity-50"
+                    >
+                      {templateSummary(t)}
+                      {t.note && (
+                        <span className="text-[var(--dim)]"> · 备注：{t.note}</span>
+                      )}
+                    </button>
+                    {confirmTemplateId === t.id ? (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setConfirmTemplateId(null);
+                            removeTemplateMut.mutate(t.id);
+                          }}
+                          aria-label={`确认从模块库删除「${templateSummary(t)}」`}
+                          className="shrink-0 border border-[var(--danger)] px-2.5 text-sm font-bold text-[var(--danger)] [border-radius:8px]"
+                        >
+                          删除
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setConfirmTemplateId(null)}
+                          className="shrink-0 bg-[var(--surface2)] px-2.5 text-sm font-medium text-[var(--text)] [border-radius:8px]"
+                        >
+                          取消
+                        </button>
+                      </>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => setConfirmTemplateId(t.id)}
+                        aria-label={`从模块库删除「${templateSummary(t)}」`}
+                        className="flex shrink-0 items-center justify-center border border-[var(--border)] bg-[var(--surface)] px-2 text-base leading-none font-bold text-[var(--danger)] [border-radius:8px]"
+                        style={{ width: 36 }}
+                      >
+                        ✕
+                      </button>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
         </div>
       )}
 
@@ -3845,6 +3990,8 @@ function CanvasView({
                         setLinkMode(true);
                         setLinkFrom(m.id);
                       }}
+                      onSaveTemplate={() => saveTemplateMut.mutate(m)}
+                      saveTemplatePending={saveTemplateMut.isPending}
                       onSaveNote={(note) => updateModuleMut.mutate({ id: m.id, note })}
                       onSaveStation={(station) =>
                         updateModuleMut.mutate({ id: m.id, station })
@@ -3872,6 +4019,8 @@ function CanvasView({
                         setLinkMode(true);
                         setLinkFrom(m.id);
                       }}
+                      onSaveTemplate={() => saveTemplateMut.mutate(m)}
+                      saveTemplatePending={saveTemplateMut.isPending}
                       onSaveText={(text) => updateModuleMut.mutate({ id: m.id, text })}
                     />
                   )}
@@ -3889,7 +4038,7 @@ function CanvasView({
       )}
 
       <p className="mt-2 text-xs leading-relaxed text-[var(--dim)]">
-        拖模块本体移动它，拖空白处平移画布，双指或滚轮缩放。连线：按住模块右侧的蓝点拖到另一个模块上松手（虚线带箭头，按顺序连就是行程顺序）；模块右上角 ✕ 整删。到站卡可开始/停止：停止后变灰待机、不查车。打开画布不自动查车：有缓存先看缓存，每张到站卡点刷新只查它自己。到站卡前三行（站名/线路/方向）点一下先出可选项点选——方向是终点站二选一、站名从站序里挑、线路从你用过的里面挑，实在没有选项才打字，选完自动保存；「＋ 加模块」里可以直接放一张空白卡，不用先查线路。
+        拖模块本体移动它，拖空白处平移画布，双指或滚轮缩放。连线：按住模块右侧的蓝点拖到另一个模块上松手（虚线带箭头，按顺序连就是行程顺序）；模块右上角 ✕ 整删。到站卡可开始/停止：停止后变灰待机、不查车。打开画布不自动查车：有缓存先看缓存，每张到站卡点刷新只查它自己。到站卡前三行（站名/线路/方向）点一下先出可选项点选——方向是终点站二选一、站名从站序里挑、线路从你用过的里面挑，实在没有选项才打字，选完自动保存；「＋ 加模块」里可以直接放一张空白卡，不用先查线路。配好的模块点卡上的「存库」存入模块库，之后在「＋ 加模块 → 我的模块库」点一下就放一份副本到画布上，副本和模板互不影响。
       </p>
     </section>
   );
@@ -3898,19 +4047,36 @@ function CanvasView({
 function CanvasCardActions({
   label,
   onStartLink,
+  onSaveTemplate,
+  saveTemplatePending,
 }: {
   label: string;
   onStartLink: () => void;
+  onSaveTemplate?: () => void;
+  saveTemplatePending?: boolean;
 }) {
   return (
-    <button
-      type="button"
-      onClick={onStartLink}
-      aria-label={`从${label}开始连线`}
-      className="shrink-0 bg-[var(--surface2)] px-2 py-0.5 text-xs font-medium text-[var(--accent)] [border-radius:999px]"
-    >
-      连线
-    </button>
+    <span className="flex shrink-0 items-center gap-1">
+      {onSaveTemplate && (
+        <button
+          type="button"
+          onClick={onSaveTemplate}
+          disabled={saveTemplatePending}
+          aria-label={`把${label}存入模块库`}
+          className="shrink-0 bg-[var(--surface2)] px-2 py-0.5 text-xs font-medium text-[var(--accent)] [border-radius:999px] disabled:opacity-50"
+        >
+          {saveTemplatePending ? "存入中…" : "存库"}
+        </button>
+      )}
+      <button
+        type="button"
+        onClick={onStartLink}
+        aria-label={`从${label}开始连线`}
+        className="shrink-0 bg-[var(--surface2)] px-2 py-0.5 text-xs font-medium text-[var(--accent)] [border-radius:999px]"
+      >
+        连线
+      </button>
+    </span>
   );
 }
 
@@ -3919,6 +4085,8 @@ function CanvasStationCard({
   city,
   entry,
   onStartLink,
+  onSaveTemplate,
+  saveTemplatePending,
   onSaveNote,
   onSaveStation,
   onSaveLine,
@@ -3929,6 +4097,8 @@ function CanvasStationCard({
   city: string;
   entry: BoardEntry | undefined;
   onStartLink: () => void;
+  onSaveTemplate: () => void;
+  saveTemplatePending: boolean;
   onSaveNote: (note: string) => void;
   onSaveStation: (station: string) => void;
   onSaveLine: (line: string) => void;
@@ -4096,6 +4266,8 @@ function CanvasStationCard({
           <CanvasCardActions
             label={`${mod.line} ${mod.station}`}
             onStartLink={onStartLink}
+            onSaveTemplate={onSaveTemplate}
+            saveTemplatePending={saveTemplatePending}
           />
         </div>
         {picker === "station" && editField !== "station" && (
@@ -4396,10 +4568,14 @@ function CanvasStationCard({
 function CanvasTextCard({
   mod,
   onStartLink,
+  onSaveTemplate,
+  saveTemplatePending,
   onSaveText,
 }: {
   mod: CanvasModule;
   onStartLink: () => void;
+  onSaveTemplate: () => void;
+  saveTemplatePending: boolean;
   onSaveText: (text: string) => void;
 }) {
   return (
@@ -4419,6 +4595,8 @@ function CanvasTextCard({
         <CanvasCardActions
           label={`文本卡 ${mod.text}`}
           onStartLink={onStartLink}
+          onSaveTemplate={onSaveTemplate}
+          saveTemplatePending={saveTemplatePending}
         />
       </div>
       <p className="text-xs text-[var(--dim)]">文本卡 · 改完点别处自动保存</p>
