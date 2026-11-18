@@ -1015,6 +1015,12 @@ const transferWalkTimesResponse = z.object({
 // 了的模块宁缺勿错、先不预置；种子标记存 settings，删空不补回。
 
 const canvasResponse = z.object({
+  // 当前项目与该城市的全部项目（画布页顶部项目栏用）；moduleCount
+  // 是每个项目的模块数，切换列表靠它区分同名/空项目
+  projectId: z.number(),
+  projects: z.array(
+    z.object({ id: z.number(), name: z.string(), moduleCount: z.number() }),
+  ),
   modules: z.array(
     z.object({
       id: z.number(),
@@ -1026,6 +1032,7 @@ const canvasResponse = z.object({
       text: z.string(),
       note: z.string(),
       enabled: z.boolean(),
+      stepIndex: z.number(),
       x: z.number(),
       y: z.number(),
     }),
@@ -1035,24 +1042,229 @@ const canvasResponse = z.object({
   ),
 });
 
+// 新建/改名项目的返回：成功带回画布全量；失败（如同名被拦截）带
+// 原因、canvas 为 null，客户端保留面板并显示原因。
+const canvasProjectOpResponse = z.object({
+  ok: z.boolean(),
+  error: z.string(),
+  canvas: canvasResponse.nullable(),
+});
+
+const CANVAS_PROJECT_LIMIT = 20;
+const DEFAULT_PROJECT_NAME = "默认项目";
+
+/**
+ * 解析当前项目：该城市还没有任何项目时先建一个默认项目，并把迁移
+ * 前遗留的 project_id=0 模块/连线迁入它（老画布内容不丢）。requestedId
+ * 指向本城市的项目时用它，否则用最早的项目。
+ */
+async function resolveCanvasProject(
+  ctx: Ctx,
+  city: string,
+  requestedId?: number,
+): Promise<{
+  projectId: number;
+  projects: { id: number; name: string; moduleCount: number }[];
+}> {
+  const db = ctx.db<typeof schema>();
+  let rows = await db
+    .select()
+    .from(schema.canvasProjects)
+    .where(eq(schema.canvasProjects.city, city))
+    .orderBy(schema.canvasProjects.id)
+    .limit(CANVAS_PROJECT_LIMIT + 5);
+  if (rows.length === 0) {
+    const created = await db
+      .insert(schema.canvasProjects)
+      .values({ city, name: DEFAULT_PROJECT_NAME })
+      .returning({ id: schema.canvasProjects.id });
+    const pid = created[0]?.id ?? 0;
+    if (pid > 0) {
+      // 一次性迁移：旧画布（项目功能上线前）的模块与连线归入默认项目
+      await db
+        .update(schema.canvasModules)
+        .set({ projectId: pid })
+        .where(
+          and(
+            eq(schema.canvasModules.city, city),
+            eq(schema.canvasModules.projectId, 0),
+          ),
+        );
+      await db
+        .update(schema.canvasLinks)
+        .set({ projectId: pid })
+        .where(
+          and(
+            eq(schema.canvasLinks.city, city),
+            eq(schema.canvasLinks.projectId, 0),
+          ),
+        );
+    }
+    rows = await db
+      .select()
+      .from(schema.canvasProjects)
+      .where(eq(schema.canvasProjects.city, city))
+      .orderBy(schema.canvasProjects.id)
+      .limit(CANVAS_PROJECT_LIMIT + 5);
+  }
+  // 每个项目的模块数：切换列表要显示「几张卡 / 空」，同名项目也分得清
+  const modRows = await db
+    .select({ projectId: schema.canvasModules.projectId })
+    .from(schema.canvasModules)
+    .where(eq(schema.canvasModules.city, city))
+    .limit(4000);
+  const counts = new Map<number, number>();
+  for (const r of modRows) {
+    counts.set(r.projectId, (counts.get(r.projectId) ?? 0) + 1);
+  }
+  const projects = rows.map((r) => ({
+    id: r.id,
+    name: r.name,
+    moduleCount: counts.get(r.id) ?? 0,
+  }));
+  const picked =
+    requestedId != null && projects.some((p) => p.id === requestedId)
+      ? requestedId
+      : (projects[0]?.id ?? 0);
+  return { projectId: picked, projects };
+}
+
+type CanvasModRow = typeof schema.canvasModules.$inferSelect;
+type CanvasLinkRow = typeof schema.canvasLinks.$inferSelect;
+
+/**
+ * 纵向流顺序（与客户端 buildFlowGroups 同口径）：链头（有连线、无入
+ * 边）按 y/x/id 排序出发，沿出边（连线 id 顺序）走到底；剩余已连线
+ * 模块再各自成链；无连线模块最后按 y/x/id 排。返回压平的模块序。
+ */
+function canvasFlowOrder(
+  mods: CanvasModRow[],
+  lnks: CanvasLinkRow[],
+): CanvasModRow[] {
+  const byId = new Map(mods.map((m) => [m.id, m]));
+  const outgoing = new Map<number, { toId: number; linkId: number }[]>();
+  const hasIncoming = new Set<number>();
+  const inAnyLink = new Set<number>();
+  for (const l of lnks) {
+    if (!byId.has(l.fromId) || !byId.has(l.toId)) continue;
+    const arr = outgoing.get(l.fromId) ?? [];
+    arr.push({ toId: l.toId, linkId: l.id });
+    outgoing.set(l.fromId, arr);
+    hasIncoming.add(l.toId);
+    inAnyLink.add(l.fromId);
+    inAnyLink.add(l.toId);
+  }
+  for (const arr of outgoing.values()) arr.sort((a, b) => a.linkId - b.linkId);
+  const sortYX = (a: CanvasModRow, b: CanvasModRow) =>
+    a.y - b.y || a.x - b.x || a.id - b.id;
+  const visited = new Set<number>();
+  const ordered: CanvasModRow[] = [];
+  const walk = (start: CanvasModRow) => {
+    let cur: CanvasModRow | undefined = start;
+    while (cur && !visited.has(cur.id)) {
+      visited.add(cur.id);
+      ordered.push(cur);
+      const nxt: { toId: number; linkId: number } | undefined = (
+        outgoing.get(cur.id) ?? []
+      ).find((o) => !visited.has(o.toId));
+      cur = nxt ? byId.get(nxt.toId) : undefined;
+    }
+  };
+  for (const h of mods
+    .filter((m) => inAnyLink.has(m.id) && !hasIncoming.has(m.id))
+    .sort(sortYX)) {
+    if (!visited.has(h.id)) walk(h);
+  }
+  for (const m of [...mods].sort(sortYX)) {
+    if (!inAnyLink.has(m.id) || visited.has(m.id)) continue;
+    walk(m);
+  }
+  for (const m of mods.filter((x) => !inAnyLink.has(x.id)).sort(sortYX)) {
+    ordered.push(m);
+  }
+  return ordered;
+}
+
+/**
+ * 步骤编号规整（listCanvas 每次读时执行、有变化才回写）：
+ * ① 全部模块都还没编号（stepIndex=0，步骤功能上线前的旧数据/种子）
+ *    → 按纵向流顺序一卡一步编号 1..N，用户已看到的顺序不变。
+ * ② 个别模块 stepIndex=0（异常兜底）→ 按流顺序接续最大步号。
+ * 编号只作分组键：删卡/并步留下的空缺不压缩（前端按分组顺序显示
+ * 「第 X 步」，空缺不影响显示），这样前端多卡级联改步时中间状态
+ * 不会被压缩打乱。
+ */
+async function normalizeCanvasSteps(
+  ctx: Ctx,
+  mods: CanvasModRow[],
+  lnks: CanvasLinkRow[],
+): Promise<void> {
+  if (mods.length === 0) return;
+  const db = ctx.db<typeof schema>();
+  const apply = async (id: number, stepIndex: number) => {
+    await db
+      .update(schema.canvasModules)
+      .set({ stepIndex })
+      .where(eq(schema.canvasModules.id, id));
+    const row = mods.find((m) => m.id === id);
+    if (row) row.stepIndex = stepIndex;
+  };
+  if (mods.every((m) => m.stepIndex <= 0)) {
+    const ordered = canvasFlowOrder(mods, lnks);
+    for (let i = 0; i < ordered.length; i++) {
+      const m = ordered[i];
+      if (m) await apply(m.id, i + 1);
+    }
+    return;
+  }
+  const zeros = mods.filter((m) => m.stepIndex <= 0);
+  if (zeros.length > 0) {
+    let next = Math.max(...mods.map((m) => m.stepIndex), 0);
+    const ordered = canvasFlowOrder(mods, lnks).filter((m) => m.stepIndex <= 0);
+    for (const m of ordered) {
+      next += 1;
+      await apply(m.id, next);
+    }
+  }
+}
+
 async function listCanvas(
   ctx: Ctx,
   city: string,
+  requestedProjectId?: number,
 ): Promise<z.infer<typeof canvasResponse>> {
   const db = ctx.db<typeof schema>();
+  const { projectId, projects } = await resolveCanvasProject(
+    ctx,
+    city,
+    requestedProjectId,
+  );
   const mods = await db
     .select()
     .from(schema.canvasModules)
-    .where(eq(schema.canvasModules.city, city))
+    .where(
+      and(
+        eq(schema.canvasModules.city, city),
+        eq(schema.canvasModules.projectId, projectId),
+      ),
+    )
     .orderBy(schema.canvasModules.id)
     .limit(200);
   const lnks = await db
     .select()
     .from(schema.canvasLinks)
-    .where(eq(schema.canvasLinks.city, city))
+    .where(
+      and(
+        eq(schema.canvasLinks.city, city),
+        eq(schema.canvasLinks.projectId, projectId),
+      ),
+    )
     .orderBy(schema.canvasLinks.id)
     .limit(400);
+  await normalizeCanvasSteps(ctx, mods, lnks);
   return {
+    projectId,
+    projects,
     modules: mods.map((m) => ({
       id: m.id,
       kind: m.kind,
@@ -1063,6 +1275,7 @@ async function listCanvas(
       text: m.text,
       note: m.note,
       enabled: m.enabled !== 0,
+      stepIndex: m.stepIndex,
       x: m.x,
       y: m.y,
     })),
@@ -1142,15 +1355,28 @@ async function seedDirection(
   return null;
 }
 
-/** 厦门画布种子：草图里的 4 个到站模块 + 马厝/同安中心文本模块 + 连线。 */
-async function maybeSeedCanvas(ctx: Ctx, city: string): Promise<void> {
+/**
+ * 厦门画布种子：草图里的 4 个到站模块 + 马厝/同安中心文本模块 + 连线。
+ * 只作用于默认项目（该城市的第一个项目），且只在该城市从未有过任何
+ * 项目时由 getCanvas 触发（调用方判定）；新建的其他项目不重复种子。
+ */
+async function maybeSeedCanvas(
+  ctx: Ctx,
+  city: string,
+  projectId: number,
+): Promise<void> {
   if (city !== DEFAULT_CITY) return;
   try {
     const db = ctx.db<typeof schema>();
     const existing = await db
       .select({ id: schema.canvasModules.id })
       .from(schema.canvasModules)
-      .where(eq(schema.canvasModules.city, city))
+      .where(
+        and(
+          eq(schema.canvasModules.city, city),
+          eq(schema.canvasModules.projectId, projectId),
+        ),
+      )
       .limit(1);
     if (existing.length > 0) return;
     if (await getSetting(ctx, `${CANVAS_SEED_KEY_PREFIX}${city}`)) return;
@@ -1166,7 +1392,7 @@ async function maybeSeedCanvas(ctx: Ctx, city: string): Promise<void> {
     ): Promise<number | null> => {
       const rows = await db
         .insert(schema.canvasModules)
-        .values(values)
+        .values({ ...values, projectId })
         .returning({ id: schema.canvasModules.id });
       return rows[0]?.id ?? null;
     };
@@ -1228,7 +1454,7 @@ async function maybeSeedCanvas(ctx: Ctx, city: string): Promise<void> {
       if (a && b) {
         await db
           .insert(schema.canvasLinks)
-          .values({ city, fromId: a, toId: b });
+          .values({ city, projectId, fromId: a, toId: b });
       }
     }
     await setSetting(ctx, `${CANVAS_SEED_KEY_PREFIX}${city}`, "1");
@@ -2368,14 +2594,269 @@ export const Actions = {
 
   getCanvas: defineAction({
     description:
-      "读取某城市画布的全部模块（到站卡/文本卡，含位置与备注）与连线。厦门画布为空且从未初始化时，先按用户通勤草图一次性预置种子（方向按线路站序实查判定，判定不了的模块不预置；用户删空后不再自动补）。city 缺省为厦门。",
-    request: z.object({ city: z.string().max(20).optional() }),
+      "读取某城市某个画布项目的全部模块（到站卡/文本卡，含位置、备注与开始/停止状态）与连线，并返回该城市的项目列表与当前项目 id。projectId 缺省或不属于该城市时用最早的项目；该城市还没有任何项目时自动建一个「默认项目」，并把项目功能上线前遗留的旧模块/连线迁入它。厦门的第一个项目为空且从未初始化时，先按用户通勤草图一次性预置种子（方向按线路站序实查判定，判定不了的模块不预置；用户删空后不再自动补；新建的其他项目不触发种子）。city 缺省为厦门。",
+    request: z.object({
+      city: z.string().max(20).optional(),
+      projectId: z.number().int().positive().optional(),
+    }),
     response: canvasResponse,
     privileged: [privileged.apizeroCall],
     async handler(ctx, args): Promise<z.infer<typeof canvasResponse>> {
       const city = cityOf(args.city);
-      await maybeSeedCanvas(ctx, city);
+      const db = ctx.db<typeof schema>();
+      const before = await db
+        .select({ id: schema.canvasProjects.id })
+        .from(schema.canvasProjects)
+        .where(eq(schema.canvasProjects.city, city))
+        .limit(1);
+      const neverHadProject = before.length === 0;
+      const { projectId, projects } = await resolveCanvasProject(
+        ctx,
+        city,
+        args.projectId,
+      );
+      // 种子只进该城市的第一个项目，且只在该城市从未有过项目时触发
+      if (neverHadProject && projects[0]?.id === projectId) {
+        await maybeSeedCanvas(ctx, city, projectId);
+      }
+      return listCanvas(ctx, city, projectId);
+    },
+  }),
+
+  createCanvasProject: defineAction({
+    description:
+      "在某城市新建一个空白画布项目（用户给整张图起的名，如「上班」），返回新项目的空画布全量（含更新后的项目列表，当前项目切到新项目）。同城已有同名项目时拦截、返回 ok:false 与原因，不产生第二个同名。每城最多 20 个项目，超出返回 ok:false 与原因。city 缺省为厦门。",
+    request: z.object({
+      name: z.string().min(1).max(30),
+      city: z.string().max(20).optional(),
+    }),
+    response: canvasProjectOpResponse,
+    async handler(ctx, args) {
+      const city = cityOf(args.city);
+      const name = args.name.trim();
+      if (!name) {
+        return { ok: false, error: "项目名不能为空", canvas: null };
+      }
+      const db = ctx.db<typeof schema>();
+      // 先确保默认项目存在（顺带迁移旧画布），再计数判上限
+      const { projects } = await resolveCanvasProject(ctx, city);
+      // 同城禁止重名：同名同貌分不清当前在哪个项目，正是用户
+      // 「点了没反应、会错乱」的来源，建之前先拦下来
+      if (projects.some((p) => p.name === name)) {
+        return {
+          ok: false,
+          error: `已有同名项目「${name}」，换个名字；想用那个项目，关掉这个面板在项目列表里点它就能切换过去`,
+          canvas: null,
+        };
+      }
+      const rows = await db
+        .select({ id: schema.canvasProjects.id })
+        .from(schema.canvasProjects)
+        .where(eq(schema.canvasProjects.city, city))
+        .limit(CANVAS_PROJECT_LIMIT + 1);
+      if (rows.length >= CANVAS_PROJECT_LIMIT) {
+        return {
+          ok: false,
+          error: `这个城市已经有 ${CANVAS_PROJECT_LIMIT} 个项目了，先删掉一个不用的再新建`,
+          canvas: null,
+        };
+      }
+      const created = await db
+        .insert(schema.canvasProjects)
+        .values({ city, name })
+        .returning({ id: schema.canvasProjects.id });
+      const pid = created[0]?.id;
+      if (!pid) {
+        return { ok: false, error: "新建项目失败，再试一次", canvas: null };
+      }
+      const canvas = await listCanvas(ctx, city, pid);
+      return { ok: true, error: "", canvas };
+    },
+  }),
+
+  renameCanvasProject: defineAction({
+    description:
+      "给某城市的一个画布项目改名（如把「默认项目」改成「上班」）。同城已有同名项目时拦截、返回 ok:false 与原因，不产生第二个同名。成功返回该项目的画布全量（含更新后的项目列表）。city 缺省为厦门。",
+    request: z.object({
+      id: z.number().int().positive(),
+      name: z.string().min(1).max(30),
+      city: z.string().max(20).optional(),
+    }),
+    response: canvasProjectOpResponse,
+    async handler(ctx, args): Promise<z.infer<typeof canvasProjectOpResponse>> {
+      const city = cityOf(args.city);
+      const name = args.name.trim();
+      if (!name) {
+        return { ok: false, error: "项目名不能为空", canvas: null };
+      }
+      const db = ctx.db<typeof schema>();
+      const { projects } = await resolveCanvasProject(ctx, city);
+      if (!projects.some((p) => p.id === args.id)) {
+        return { ok: false, error: "这个项目不存在，可能已经被删了", canvas: null };
+      }
+      // 同城禁止重名（改回自己的原名不算重名）
+      if (projects.some((p) => p.id !== args.id && p.name === name)) {
+        return {
+          ok: false,
+          error: `已有同名项目「${name}」，换个名字；想用那个项目，在项目列表里点它就能切换过去`,
+          canvas: null,
+        };
+      }
+      await db
+        .update(schema.canvasProjects)
+        .set({ name })
+        .where(
+          and(
+            eq(schema.canvasProjects.id, args.id),
+            eq(schema.canvasProjects.city, city),
+          ),
+        );
+      const canvas = await listCanvas(ctx, city, args.id);
+      return { ok: true, error: "", canvas };
+    },
+  }),
+
+  deleteCanvasProject: defineAction({
+    description:
+      "删除某城市的一个画布项目，连带删掉它名下的全部模块与连线（模块库模板不受影响，其他项目不受影响）。删完返回剩余最早项目的画布全量；若那是最后一个项目，会自动建一个新的空白「默认项目」承接。city 缺省为厦门。",
+    request: z.object({
+      id: z.number().int().positive(),
+      city: z.string().max(20).optional(),
+    }),
+    response: canvasResponse,
+    async handler(ctx, args): Promise<z.infer<typeof canvasResponse>> {
+      const city = cityOf(args.city);
+      const db = ctx.db<typeof schema>();
+      await db
+        .delete(schema.canvasLinks)
+        .where(
+          and(
+            eq(schema.canvasLinks.city, city),
+            eq(schema.canvasLinks.projectId, args.id),
+          ),
+        );
+      await db
+        .delete(schema.canvasModules)
+        .where(
+          and(
+            eq(schema.canvasModules.city, city),
+            eq(schema.canvasModules.projectId, args.id),
+          ),
+        );
+      await db
+        .delete(schema.canvasProjects)
+        .where(
+          and(
+            eq(schema.canvasProjects.id, args.id),
+            eq(schema.canvasProjects.city, city),
+          ),
+        );
       return listCanvas(ctx, city);
+    },
+  }),
+
+  repairCanvasProjects: defineAction({
+    description:
+      "一次性理顺某城市的画布项目（幂等，可重复调用、已理顺时什么都不改）：同名拦截上线前用户建出了重名项目与空项目，切换时分不清、像没保存。理顺规则：装有模块的那个项目改名为「上班」（其内容本就是上班路线）；空项目只保留一个、命名为「下班」（优先留已叫「下班」的），其余空项目连带其连线删除。只动项目名与空项目，绝不改动任何模块、连线、步号与启停状态。没有装模块的项目时不做任何改动。返回实际执行的动作与理顺后的项目清单（含模块数）。city 缺省为厦门。",
+    request: z.object({
+      city: z.string().max(20).optional(),
+    }),
+    response: z.object({
+      changed: z.boolean(),
+      actions: z.array(z.string()),
+      projects: z.array(
+        z.object({ id: z.number(), name: z.string(), moduleCount: z.number() }),
+      ),
+    }),
+    async handler(ctx, args) {
+      const city = cityOf(args.city);
+      const db = ctx.db<typeof schema>();
+      const done: string[] = [];
+      const loadState = async () => {
+        const projs = await db
+          .select()
+          .from(schema.canvasProjects)
+          .where(eq(schema.canvasProjects.city, city))
+          .orderBy(schema.canvasProjects.id)
+          .limit(CANVAS_PROJECT_LIMIT + 5);
+        const modRows = await db
+          .select({ projectId: schema.canvasModules.projectId })
+          .from(schema.canvasModules)
+          .where(eq(schema.canvasModules.city, city))
+          .limit(4000);
+        const counts = new Map<number, number>();
+        for (const r of modRows) {
+          counts.set(r.projectId, (counts.get(r.projectId) ?? 0) + 1);
+        }
+        return projs.map((p) => ({
+          id: p.id,
+          name: p.name,
+          moduleCount: counts.get(p.id) ?? 0,
+        }));
+      };
+      let state = await loadState();
+      // 装有模块的项目（有多个时取模块最多的、并列取最早建的）
+      const holder = state
+        .filter((p) => p.moduleCount > 0)
+        .sort((a, b) => b.moduleCount - a.moduleCount || a.id - b.id)[0];
+      if (holder) {
+        const empties = state.filter(
+          (p) => p.id !== holder.id && p.moduleCount === 0,
+        );
+        // 空项目只保留一个：优先留已经叫「下班」的，否则留最早建的
+        const keeper =
+          empties.find((p) => p.name === "下班") ?? empties[0];
+        for (const p of empties) {
+          if (keeper && p.id === keeper.id) continue;
+          await db
+            .delete(schema.canvasLinks)
+            .where(
+              and(
+                eq(schema.canvasLinks.city, city),
+                eq(schema.canvasLinks.projectId, p.id),
+              ),
+            );
+          await db
+            .delete(schema.canvasProjects)
+            .where(
+              and(
+                eq(schema.canvasProjects.id, p.id),
+                eq(schema.canvasProjects.city, city),
+              ),
+            );
+          done.push(`删除多余的空项目「${p.name}」（id=${p.id}）`);
+        }
+        // 先把保留的空项目改成「下班」（它若正占着「上班」这个名字，
+        // 先让出来），再把装模块的项目改成「上班」，全程不重名
+        if (keeper && keeper.name !== "下班") {
+          await db
+            .update(schema.canvasProjects)
+            .set({ name: "下班" })
+            .where(
+              and(
+                eq(schema.canvasProjects.id, keeper.id),
+                eq(schema.canvasProjects.city, city),
+              ),
+            );
+          done.push(`保留的空项目「${keeper.name}」（id=${keeper.id}）改名为「下班」`);
+        }
+        if (holder.name !== "上班") {
+          await db
+            .update(schema.canvasProjects)
+            .set({ name: "上班" })
+            .where(
+              and(
+                eq(schema.canvasProjects.id, holder.id),
+                eq(schema.canvasProjects.city, city),
+              ),
+            );
+          done.push(
+            `装有 ${holder.moduleCount} 个模块的项目「${holder.name}」（id=${holder.id}）改名为「上班」`,
+          );
+        }
+        state = await loadState();
+      }
+      return { changed: done.length > 0, actions: done, projects: state };
     },
   }),
 
@@ -2393,13 +2874,34 @@ export const Actions = {
       x: z.number().min(-10000).max(10000),
       y: z.number().min(-10000).max(10000),
       city: z.string().max(20).optional(),
+      projectId: z.number().int().positive().optional(),
     }),
     response: canvasResponse,
     async handler(ctx, args): Promise<z.infer<typeof canvasResponse>> {
       const city = cityOf(args.city);
       const db = ctx.db<typeof schema>();
+      const { projectId } = await resolveCanvasProject(
+        ctx,
+        city,
+        args.projectId,
+      );
+      // 新卡默认接续为新的一步（当前最大步号 + 1），用户事后可并步
+      const stepRows = await db
+        .select({ stepIndex: schema.canvasModules.stepIndex })
+        .from(schema.canvasModules)
+        .where(
+          and(
+            eq(schema.canvasModules.city, city),
+            eq(schema.canvasModules.projectId, projectId),
+          ),
+        )
+        .limit(400);
+      const nextStep =
+        stepRows.reduce((mx, r) => Math.max(mx, r.stepIndex), 0) + 1;
       await db.insert(schema.canvasModules).values({
         city,
+        projectId,
+        stepIndex: nextStep,
         kind: args.kind,
         line: args.kind === "station" ? normalizeLine(args.line ?? "") : "",
         station: args.kind === "station" ? (args.station ?? "").trim() : "",
@@ -2420,13 +2922,13 @@ export const Actions = {
           });
         }
       }
-      return listCanvas(ctx, city);
+      return listCanvas(ctx, city, projectId);
     },
   }),
 
   updateCanvasModule: defineAction({
     description:
-      "更新画布模块：传 x/y 改位置（拖动结束时保存），传 note 改备注，传 text 改文本模块的文字，传 enabled 开/停到站模块（停止后不查实时），传 direction/terminal 补选方向（从规划转入时方向定不了的模块用），传 line/station 改到站模块的线路与站名（空白卡就地填写用，line 会按规范补「路」后缀）；没传的字段不动。返回该城市画布全量。city 缺省为厦门。",
+      "更新画布模块：传 x/y 改位置（拖动结束时保存），传 note 改备注，传 text 改文本模块的文字，传 enabled 开/停到站模块（停止后不查实时），传 direction/terminal 补选方向（从规划转入时方向定不了的模块用），传 line/station 改到站模块的线路与站名（空白卡就地填写用，line 会按规范补「路」后缀），传 stepIndex 改它属于哪一步（同一步号的多个模块是备选方案；步号只是分组键、允许空缺）；没传的字段不动。返回该城市画布全量。city 缺省为厦门。",
     request: z.object({
       id: z.number().int().positive(),
       x: z.number().min(-10000).max(10000).optional(),
@@ -2438,7 +2940,9 @@ export const Actions = {
       terminal: z.string().max(40).optional(),
       line: z.string().max(20).optional(),
       station: z.string().max(40).optional(),
+      stepIndex: z.number().int().min(1).max(99).optional(),
       city: z.string().max(20).optional(),
+      projectId: z.number().int().positive().optional(),
     }),
     response: canvasResponse,
     async handler(ctx, args): Promise<z.infer<typeof canvasResponse>> {
@@ -2447,6 +2951,7 @@ export const Actions = {
       const set: Partial<typeof schema.canvasModules.$inferInsert> = {};
       if (args.x !== undefined) set.x = args.x;
       if (args.y !== undefined) set.y = args.y;
+      if (args.stepIndex !== undefined) set.stepIndex = args.stepIndex;
       if (args.note !== undefined) set.note = args.note.trim();
       if (args.text !== undefined) set.text = args.text.trim();
       if (args.enabled !== undefined) set.enabled = args.enabled ? 1 : 0;
@@ -2478,7 +2983,7 @@ export const Actions = {
           });
         }
       }
-      return listCanvas(ctx, city);
+      return listCanvas(ctx, city, args.projectId);
     },
   }),
 
@@ -2488,6 +2993,7 @@ export const Actions = {
     request: z.object({
       id: z.number().int().positive(),
       city: z.string().max(20).optional(),
+      projectId: z.number().int().positive().optional(),
     }),
     response: canvasResponse,
     async handler(ctx, args): Promise<z.infer<typeof canvasResponse>> {
@@ -2504,7 +3010,7 @@ export const Actions = {
       await db
         .delete(schema.canvasModules)
         .where(eq(schema.canvasModules.id, args.id));
-      return listCanvas(ctx, city);
+      return listCanvas(ctx, city, args.projectId);
     },
   }),
 
@@ -2515,11 +3021,17 @@ export const Actions = {
       fromId: z.number().int().positive(),
       toId: z.number().int().positive(),
       city: z.string().max(20).optional(),
+      projectId: z.number().int().positive().optional(),
     }),
     response: canvasResponse,
     async handler(ctx, args): Promise<z.infer<typeof canvasResponse>> {
       const city = cityOf(args.city);
       const db = ctx.db<typeof schema>();
+      const { projectId } = await resolveCanvasProject(
+        ctx,
+        city,
+        args.projectId,
+      );
       if (args.fromId !== args.toId) {
         const mods = await db
           .select({ id: schema.canvasModules.id })
@@ -2527,6 +3039,7 @@ export const Actions = {
           .where(
             and(
               eq(schema.canvasModules.city, city),
+              eq(schema.canvasModules.projectId, projectId),
               or(
                 eq(schema.canvasModules.id, args.fromId),
                 eq(schema.canvasModules.id, args.toId),
@@ -2556,21 +3069,23 @@ export const Actions = {
           if (dup.length === 0) {
             await db.insert(schema.canvasLinks).values({
               city,
+              projectId,
               fromId: args.fromId,
               toId: args.toId,
             });
           }
         }
       }
-      return listCanvas(ctx, city);
+      return listCanvas(ctx, city, projectId);
     },
   }),
 
   removeCanvasLink: defineAction({
-    description: "删除画布上的一条连线。返回该城市画布全量。city 缺省为厦门。",
+    description: "删除画布上的一条连线。返回该城市当前项目的画布全量。city 缺省为厦门。",
     request: z.object({
       id: z.number().int().positive(),
       city: z.string().max(20).optional(),
+      projectId: z.number().int().positive().optional(),
     }),
     response: canvasResponse,
     async handler(ctx, args): Promise<z.infer<typeof canvasResponse>> {
@@ -2579,7 +3094,7 @@ export const Actions = {
       await db
         .delete(schema.canvasLinks)
         .where(eq(schema.canvasLinks.id, args.id));
-      return listCanvas(ctx, city);
+      return listCanvas(ctx, city, args.projectId);
     },
   }),
 
@@ -2694,22 +3209,40 @@ export const Actions = {
         .min(1)
         .max(20),
       city: z.string().max(20).optional(),
+      projectId: z.number().int().positive().optional(),
     }),
     response: canvasResponse,
     async handler(ctx, args): Promise<z.infer<typeof canvasResponse>> {
       const city = cityOf(args.city);
       const db = ctx.db<typeof schema>();
+      // 转入当前项目（projectId 缺省时用最早的项目）
+      const { projectId } = await resolveCanvasProject(
+        ctx,
+        city,
+        args.projectId,
+      );
 
-      // 新链排在现有内容下方：取现有模块的最大 y 再下移一行多
+      // 新链排在当前项目现有内容下方：取现有模块的最大 y 再下移一行多
       const existing = await db
-        .select({ y: schema.canvasModules.y })
+        .select({
+          y: schema.canvasModules.y,
+          stepIndex: schema.canvasModules.stepIndex,
+        })
         .from(schema.canvasModules)
-        .where(eq(schema.canvasModules.city, city))
+        .where(
+          and(
+            eq(schema.canvasModules.city, city),
+            eq(schema.canvasModules.projectId, projectId),
+          ),
+        )
         .limit(400);
       const baseY =
         existing.length > 0
           ? Math.max(...existing.map((r) => r.y)) + 300
           : 40;
+      // 转入的每个模块依次接续为新的一步（用户事后可并步成备选）
+      let nextStep =
+        existing.reduce((mx, r) => Math.max(mx, r.stepIndex), 0) + 1;
       const baseX = 40;
       const stepX = 292;
       const perRow = 7;
@@ -2808,6 +3341,8 @@ export const Actions = {
           .insert(schema.canvasModules)
           .values({
             city,
+            projectId,
+            stepIndex: nextStep++,
             kind: spec.kind,
             line: spec.kind === "station" ? (spec.line ?? "") : "",
             station: spec.kind === "station" ? (spec.station ?? "") : "",
@@ -2827,10 +3362,10 @@ export const Actions = {
         if (a && b) {
           await db
             .insert(schema.canvasLinks)
-            .values({ city, fromId: a, toId: b });
+            .values({ city, projectId, fromId: a, toId: b });
         }
       }
-      return listCanvas(ctx, city);
+      return listCanvas(ctx, city, projectId);
     },
   }),
 

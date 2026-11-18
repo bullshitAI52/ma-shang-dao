@@ -4,6 +4,7 @@ import {
   useState,
   type FormEvent,
   type PointerEvent as ReactPointerEvent,
+  type ReactNode,
 } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { SafeAreaTopScrim } from "@hatch/space-sdk/client";
@@ -79,7 +80,7 @@ type HomeMode = "query" | "line" | "station";
 
 function LineBadge({ name }: { name: string }) {
   return (
-    <span className="inline-flex shrink-0 items-center bg-[var(--accent)] px-2 py-0.5 text-sm font-bold text-[var(--accent-ink)] [border-radius:6px]">
+    <span className="inline-flex shrink-0 items-center bg-[var(--accent)] px-2.5 py-1 text-base font-bold text-[var(--accent-ink)] [border-radius:6px]">
       {name}
     </span>
   );
@@ -516,12 +517,27 @@ export function App() {
         walkDistance: string;
         terminal?: string;
       }[];
-    }) => api.importPlanToCanvas({ ...args, city }),
+    }) => {
+      // 转入用户当前所在的画布项目（画布页把当前项目 id 记在本地）
+      let pid: number | undefined;
+      try {
+        const v = Number(window.localStorage.getItem(`canvas-project:${city}`));
+        if (Number.isFinite(v) && v > 0) pid = v;
+      } catch {
+        // 读不到本地记录就让服务端用最早的项目
+      }
+      return api.importPlanToCanvas({ ...args, city, projectId: pid });
+    },
     onSuccess: (data) => {
-      const prev = queryClient.getQueryData<CanvasData>(["canvas", city]);
-      const prevIds = new Set((prev?.modules ?? []).map((m) => m.id));
+      const prev = queryClient.getQueryData<CanvasData>(["canvasLatest", city]);
+      const prevIds = new Set(
+        prev && prev.projectId === data.projectId
+          ? prev.modules.map((m) => m.id)
+          : [],
+      );
       const fresh = data.modules.filter((m) => !prevIds.has(m.id));
-      queryClient.setQueryData(["canvas", city], data);
+      queryClient.setQueryData(["canvasLatest", city], data);
+      queryClient.setQueryData(["canvas", city, data.projectId], data);
       if (fresh.length > 0) {
         setCanvasFocus({
           y: Math.min(...fresh.map((m) => m.y)),
@@ -1485,7 +1501,7 @@ export function App() {
 
         {/* ============ 画布 ============ */}
         {tab === "canvas" && (
-          <CanvasView city={city} onBack={() => setTab("home")} focus={canvasFocus} />
+          <CanvasView key={city} city={city} onBack={() => setTab("home")} focus={canvasFocus} />
         )}
 
         {/* ============ 设置 ============ */}
@@ -3013,10 +3029,82 @@ function SettingsPanel({
 
 const CANVAS_WORLD_W = 2400;
 const CANVAS_WORLD_H = 1800;
-const CANVAS_MODULE_W = 232;
+// 卡片基础宽度：手机上至少正文字号可读、按钮热区 ≥40px，232 太挤，
+// 放大到 272；宁可平移画布也不要把卡缩到看不清。
+const CANVAS_MODULE_W = 272;
+// 模块高度估算（到站卡五行 + 按钮行约 210），只用于打开时 fit、
+// 新模块避让重叠的粗算，不参与真实渲染。
+const CANVAS_MODULE_H_EST = 215;
 
 function clampScale(k: number): number {
   return Math.min(2.5, Math.max(0.3, k));
+}
+
+// 纵向流的链推导：按连线关系把模块排成一条条链。链头 = 有连线但
+// 没有入边的模块；从链头沿出边（按连线 id 顺序取第一条未走过的）
+// 一路走到底。分支的另一条边、环等剩余的已连线模块再各自成组；
+// 完全没有连线的模块最后单独成组（loose，chain=false）。
+// 流模式的顺序只由连线推导、不另存：调序即改写连线（见 reorderMut），
+// 自由画布的 x/y 坐标完全不受影响。
+type FlowGroup = {
+  modules: CanvasModule[];
+  pathLinkIds: number[];
+  chain: boolean;
+};
+
+function buildFlowGroups(
+  mods: CanvasModule[],
+  lnks: CanvasData["links"],
+): FlowGroup[] {
+  const byId = new Map(mods.map((m) => [m.id, m]));
+  const outgoing = new Map<number, { toId: number; linkId: number }[]>();
+  const hasIncoming = new Set<number>();
+  const inAnyLink = new Set<number>();
+  for (const l of lnks) {
+    if (!byId.has(l.fromId) || !byId.has(l.toId)) continue;
+    const arr = outgoing.get(l.fromId) ?? [];
+    arr.push({ toId: l.toId, linkId: l.id });
+    outgoing.set(l.fromId, arr);
+    hasIncoming.add(l.toId);
+    inAnyLink.add(l.fromId);
+    inAnyLink.add(l.toId);
+  }
+  for (const arr of outgoing.values()) arr.sort((a, b) => a.linkId - b.linkId);
+  const sortYX = (a: CanvasModule, b: CanvasModule) =>
+    a.y - b.y || a.x - b.x || a.id - b.id;
+  const visited = new Set<number>();
+  const walk = (start: CanvasModule) => {
+    const arr: CanvasModule[] = [];
+    const pathIds: number[] = [];
+    let cur: CanvasModule | undefined = start;
+    while (cur && !visited.has(cur.id)) {
+      visited.add(cur.id);
+      arr.push(cur);
+      const nxt = (outgoing.get(cur.id) ?? []).find((o) => !visited.has(o.toId));
+      if (!nxt) break;
+      pathIds.push(nxt.linkId);
+      cur = byId.get(nxt.toId);
+    }
+    return { arr, pathIds };
+  };
+  const groups: FlowGroup[] = [];
+  const heads = mods
+    .filter((m) => inAnyLink.has(m.id) && !hasIncoming.has(m.id))
+    .sort(sortYX);
+  for (const h of heads) {
+    if (visited.has(h.id)) continue;
+    const { arr, pathIds } = walk(h);
+    if (arr.length > 0) groups.push({ modules: arr, pathLinkIds: pathIds, chain: true });
+  }
+  for (const m of [...mods].sort(sortYX)) {
+    if (!inAnyLink.has(m.id) || visited.has(m.id)) continue;
+    const { arr, pathIds } = walk(m);
+    if (arr.length > 0) groups.push({ modules: arr, pathLinkIds: pathIds, chain: true });
+  }
+  for (const m of mods.filter((x) => !inAnyLink.has(x.id)).sort(sortYX)) {
+    groups.push({ modules: [m], pathLinkIds: [], chain: false });
+  }
+  return groups;
 }
 
 function CanvasView({
@@ -3033,12 +3121,103 @@ function CanvasView({
   const submitCls =
     "shrink-0 bg-[var(--accent)] px-5 font-bold text-[var(--accent-ink)] [border-radius:8px] disabled:opacity-50";
   const queryClient = useQueryClient();
-  const canvasQ = useQuery({
-    queryKey: ["canvas", city],
-    queryFn: () => api.getCanvas({ city }),
+  // 画布项目：当前项目 id 记在本地（按城市），服务端返回的 projectId
+  // 为准（本地存的可能已删或不属于本城时以服务端落定的为准）。
+  const projectStorageKey = `canvas-project:${city}`;
+  const [projectId, setProjectId] = useState<number>(() => {
+    try {
+      const v = Number(window.localStorage.getItem(projectStorageKey));
+      return Number.isFinite(v) && v > 0 ? v : 0;
+    } catch {
+      return 0;
+    }
   });
+  const canvasQ = useQuery({
+    queryKey: ["canvas", city, projectId],
+    queryFn: () =>
+      api.getCanvas({ city, projectId: projectId > 0 ? projectId : undefined }),
+  });
+  const projects = canvasQ.data?.projects ?? [];
+  const curProjectId = canvasQ.data?.projectId ?? 0;
+  const currentProject = projects.find((p) => p.id === curProjectId);
+  useEffect(() => {
+    const pid = canvasQ.data?.projectId;
+    if (!pid) return;
+    if (pid !== projectId) setProjectId(pid);
+    try {
+      window.localStorage.setItem(projectStorageKey, String(pid));
+    } catch {
+      // 存不下不影响使用，只是下次打开回到最早的项目
+    }
+    // 给规划/行程转画布留一份最新画布镜像（算新链位置用）
+    queryClient.setQueryData(["canvasLatest", city], canvasQ.data);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canvasQ.data]);
   const modules = canvasQ.data?.modules ?? [];
   const links = canvasQ.data?.links ?? [];
+  const modulesRef = useRef(modules);
+  modulesRef.current = modules;
+  const linksRef = useRef(links);
+  linksRef.current = links;
+
+  // 显示模式：自由画布（free）/ 纵向流（flow）。选择按「城市+项目」
+  // 记在 localStorage；没记过的项目，窄屏（<640px）默认纵向流、
+  // 宽屏默认自由画布。
+  const [canvasMode, setCanvasMode] = useState<"free" | "flow">("flow");
+  const canvasModeRef = useRef(canvasMode);
+  canvasModeRef.current = canvasMode;
+  const modeProjectRef = useRef(0);
+  useEffect(() => {
+    if (!curProjectId || modeProjectRef.current === curProjectId) return;
+    modeProjectRef.current = curProjectId;
+    let v: string | null = null;
+    try {
+      v = window.localStorage.getItem(`canvas-mode:${city}:${curProjectId}`);
+    } catch {
+      v = null;
+    }
+    if (v === "free" || v === "flow") setCanvasMode(v);
+    else setCanvasMode(window.innerWidth < 640 ? "flow" : "free");
+  }, [curProjectId, city]);
+  const switchMode = (m: "free" | "flow") => {
+    setCanvasMode(m);
+    try {
+      window.localStorage.setItem(`canvas-mode:${city}:${curProjectId}`, m);
+    } catch {
+      // 存不下不影响本次切换
+    }
+  };
+  // 纵向流分组：由连线推导（buildFlowGroups），渲染与调序共用
+  const flowGroups = buildFlowGroups(modules, links);
+  // 步骤分组：把流顺序压平，连续同 stepIndex 的卡归为一步——同一步
+  // 是备选（或），步与步之间是先后（然后）。显示的「第 X 步」用步组
+  // 在序列中的序号（stepIndex 只是分组键、允许空缺，序号永远连续）。
+  type FlowEntry = { mod: CanvasModule; group: FlowGroup; idx: number };
+  const flowSeq: FlowEntry[] = flowGroups.flatMap((g) =>
+    g.modules.map((m, idx) => ({ mod: m, group: g, idx })),
+  );
+  type StepGroup = { step: number; entries: FlowEntry[] };
+  const stepGroups: StepGroup[] = [];
+  for (const e of flowSeq) {
+    const last = stepGroups[stepGroups.length - 1];
+    if (last && last.step === e.mod.stepIndex) last.entries.push(e);
+    else stepGroups.push({ step: e.mod.stepIndex, entries: [e] });
+  }
+  // 每张卡的步骤信息：所属步组的序号（显示用）、组内第几个方案
+  const stepInfoById = new Map<
+    number,
+    { ordinal: number; inGroup: number; groupSize: number }
+  >();
+  stepGroups.forEach((sg, gi) => {
+    sg.entries.forEach((e, i) => {
+      stepInfoById.set(e.mod.id, {
+        ordinal: gi + 1,
+        inGroup: i,
+        groupSize: sg.entries.length,
+      });
+    });
+  });
+  const maxStepIndex = modules.reduce((mx, m) => Math.max(mx, m.stepIndex), 0);
   // 停止状态的到站模块不进快照、不发起任何查询；空白卡（线路/站名
   // 还没填）也没有可查的键，一样不进快照
   const stationMods = modules.filter(
@@ -3062,8 +3241,11 @@ function CanvasView({
   });
   const entryOf = (id: number) => snapshot.data?.entries.find((e) => e.id === id);
 
-  const applyCanvas = (data: CanvasData) =>
-    queryClient.setQueryData(["canvas", city], data);
+  const applyCanvas = (data: CanvasData) => {
+    queryClient.setQueryData(["canvas", city, data.projectId], data);
+    queryClient.setQueryData(["canvasLatest", city], data);
+    if (data.projectId !== projectId) setProjectId(data.projectId);
+  };
   const addModuleMut = useMutation({
     mutationFn: (args: {
       kind: "station" | "text";
@@ -3075,8 +3257,33 @@ function CanvasView({
       note?: string;
       x: number;
       y: number;
-    }) => api.addCanvasModule({ ...args, city }),
-    onSuccess: applyCanvas,
+    }) =>
+      api.addCanvasModule({
+        ...args,
+        city,
+        projectId: curProjectId > 0 ? curProjectId : undefined,
+      }),
+    onSuccess: (data) => {
+      const prevModules = modulesRef.current;
+      const prevLinks = linksRef.current;
+      applyCanvas(data);
+      // 纵向流里加模块：新卡自动接到当前最后一条链的链尾，
+      // 流里立刻排在链的最后；没有链时就作独立卡排最后。
+      if (canvasModeRef.current === "flow") {
+        const prevIds = new Set(prevModules.map((m) => m.id));
+        const fresh = data.modules.filter((m) => !prevIds.has(m.id));
+        if (fresh.length === 1 && fresh[0]) {
+          const chains = buildFlowGroups(prevModules, prevLinks).filter(
+            (g) => g.chain,
+          );
+          const lastChain = chains[chains.length - 1];
+          const tail = lastChain?.modules[lastChain.modules.length - 1];
+          if (tail && tail.id !== fresh[0].id) {
+            addLinkMut.mutate({ fromId: tail.id, toId: fresh[0].id });
+          }
+        }
+      }
+    },
   });
   const updateModuleMut = useMutation({
     mutationFn: (args: {
@@ -3090,22 +3297,200 @@ function CanvasView({
       terminal?: string;
       line?: string;
       station?: string;
-    }) => api.updateCanvasModule({ ...args, city }),
+      stepIndex?: number;
+    }) =>
+      api.updateCanvasModule({
+        ...args,
+        city,
+        projectId: curProjectId > 0 ? curProjectId : undefined,
+      }),
     onSuccess: applyCanvas,
   });
   const removeModuleMut = useMutation({
-    mutationFn: (id: number) => api.removeCanvasModule({ id, city }),
+    mutationFn: (id: number) =>
+      api.removeCanvasModule({
+        id,
+        city,
+        projectId: curProjectId > 0 ? curProjectId : undefined,
+      }),
     onSuccess: applyCanvas,
   });
   const addLinkMut = useMutation({
     mutationFn: (args: { fromId: number; toId: number }) =>
-      api.addCanvasLink({ ...args, city }),
+      api.addCanvasLink({
+        ...args,
+        city,
+        projectId: curProjectId > 0 ? curProjectId : undefined,
+      }),
     onSuccess: applyCanvas,
   });
   const removeLinkMut = useMutation({
-    mutationFn: (id: number) => api.removeCanvasLink({ id, city }),
+    mutationFn: (id: number) =>
+      api.removeCanvasLink({
+        id,
+        city,
+        projectId: curProjectId > 0 ? curProjectId : undefined,
+      }),
     onSuccess: applyCanvas,
   });
+
+  // 纵向流调序：与相邻卡换位后，按新顺序改写这条链的连线——
+  // 先删旧的链路连线，再按新顺序逐段连回来，链仍是一条链；
+  // 存的是连线本身，自由画布的模块坐标完全不动。
+  // 跨步调序的规整规则：若换位的两张卡步号不同，两卡同时互换步号
+  // ——卡换位置、步号留原位，于是流顺序里的步号保持不倒挂、每步的
+  // 卡数不变；同一步内换位步号不动。
+  const reorderMut = useMutation({
+    mutationFn: async (args: { group: FlowGroup; from: number; to: number }) => {
+      const arr = [...args.group.modules];
+      const [mv] = arr.splice(args.from, 1);
+      if (!mv) return null;
+      arr.splice(args.to, 0, mv);
+      const pid = curProjectId > 0 ? curProjectId : undefined;
+      for (const id of args.group.pathLinkIds) {
+        await api.removeCanvasLink({ id, city, projectId: pid });
+      }
+      let data: CanvasData | null = null;
+      for (let i = 0; i < arr.length - 1; i++) {
+        const a = arr[i];
+        const b = arr[i + 1];
+        if (!a || !b) continue;
+        data = await api.addCanvasLink({
+          fromId: a.id,
+          toId: b.id,
+          city,
+          projectId: pid,
+        });
+      }
+      const other = args.group.modules[args.to];
+      if (other && other.id !== mv.id && other.stepIndex !== mv.stepIndex) {
+        data = await api.updateCanvasModule({
+          id: mv.id,
+          stepIndex: other.stepIndex,
+          city,
+          projectId: pid,
+        });
+        data = await api.updateCanvasModule({
+          id: other.id,
+          stepIndex: mv.stepIndex,
+          city,
+          projectId: pid,
+        });
+      }
+      return data;
+    },
+    onSuccess: (data) => {
+      if (data) applyCanvas(data);
+    },
+  });
+
+  // 改步：一批 {id, stepIndex} 依次落库，最后一份全量回填。
+  // - 并入上一步：单卡改成上一张卡的步号。
+  // - 独立成下一步：本卡先改到「本步步号+1」，其后各步再依次 +1
+  //   让位——按这个顺序写，中间状态不会把别的步误并进来。
+  // - 步进器 −/+：单卡步号 ±1，与相邻步同号即并入那一步。
+  const setStepMut = useMutation({
+    mutationFn: async (changes: { id: number; stepIndex: number }[]) => {
+      const pid = curProjectId > 0 ? curProjectId : undefined;
+      let data: CanvasData | null = null;
+      for (const c of changes) {
+        data = await api.updateCanvasModule({
+          id: c.id,
+          stepIndex: c.stepIndex,
+          city,
+          projectId: pid,
+        });
+      }
+      return data;
+    },
+    onSuccess: (data) => {
+      if (data) applyCanvas(data);
+    },
+  });
+  const stepBusy = setStepMut.isPending || updateModuleMut.isPending;
+  // 与上一张同一步：上一张卡存在且步号不同才可并
+  const mergeWithPrev = (seqIdx: number) => {
+    const cur = flowSeq[seqIdx];
+    const prev = flowSeq[seqIdx - 1];
+    if (!cur || !prev || prev.mod.stepIndex === cur.mod.stepIndex) return;
+    setStepMut.mutate([{ id: cur.mod.id, stepIndex: prev.mod.stepIndex }]);
+  };
+  // 独立成下一步：本卡所在的步组多于一张卡时，把本卡拆成紧随其后
+  // 的新一步，其后各步依次 +1 让位
+  const splitToOwnStep = (entry: FlowEntry) => {
+    const s = entry.mod.stepIndex;
+    const changes: { id: number; stepIndex: number }[] = [
+      { id: entry.mod.id, stepIndex: s + 1 },
+    ];
+    const later = flowSeq.filter(
+      (e) => e.mod.stepIndex > s && e.mod.id !== entry.mod.id,
+    );
+    for (const e of later) {
+      changes.push({ id: e.mod.id, stepIndex: e.mod.stepIndex + 1 });
+    }
+    setStepMut.mutate(changes);
+  };
+
+  // 项目操作：新建（空白画布起步、建好自动切过去）、改名、删除
+  // （确认一次，连带删该项目的模块与连线；模块库不受影响）。
+  const [projectPanel, setProjectPanel] = useState<
+    "none" | "switch" | "menu" | "create" | "rename" | "delete"
+  >("none");
+  const [projectNameInput, setProjectNameInput] = useState("");
+  const [projectError, setProjectError] = useState("");
+  const createProjectMut = useMutation({
+    mutationFn: (name: string) => api.createCanvasProject({ city, name }),
+    onSuccess: (res) => {
+      if (res.ok && res.canvas) {
+        applyCanvas(res.canvas);
+        setProjectPanel("none");
+        setProjectNameInput("");
+        setProjectError("");
+      } else {
+        setProjectError(res.error || "新建项目失败，再试一次");
+      }
+    },
+    onError: () => setProjectError("新建项目失败，再试一次"),
+  });
+  const renameProjectMut = useMutation({
+    mutationFn: (args: { id: number; name: string }) =>
+      api.renameCanvasProject({ ...args, city }),
+    onSuccess: (res) => {
+      if (res.ok && res.canvas) {
+        applyCanvas(res.canvas);
+        setProjectPanel("none");
+        setProjectNameInput("");
+        setProjectError("");
+      } else {
+        // 同名被服务端拦截：面板留着、把原因显示出来，不静默失败
+        setProjectError(res.error || "改名失败，再试一次");
+      }
+    },
+    onError: () => setProjectError("改名失败，再试一次"),
+  });
+  const deleteProjectMut = useMutation({
+    mutationFn: (id: number) => api.deleteCanvasProject({ id, city }),
+    onSuccess: (data) => {
+      applyCanvas(data);
+      setProjectPanel("none");
+      setProjectError("");
+    },
+    onError: () => setProjectError("删除项目失败，再试一次"),
+  });
+  const switchProject = (id: number) => {
+    // 点了就先关面板清错误：哪怕点的是当前项目，也不能看起来没反应
+    setProjectPanel("none");
+    setProjectError("");
+    if (id === curProjectId) return;
+    setLinkMode(false);
+    setLinkFrom(null);
+    setProjectId(id);
+    try {
+      window.localStorage.setItem(projectStorageKey, String(id));
+    } catch {
+      // 存不下不影响本次切换
+    }
+  };
 
   // 模块库：配好的模块存成模板（只存配置、按城市隔离），之后在
   // 「＋ 加模块」面板里点一下就在画布空位放一份独立副本。副本与
@@ -3164,6 +3549,67 @@ function CanvasView({
   // 视口（平移 + 缩放）
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [view, setView] = useState({ x: 16, y: 16, k: 1 });
+
+  // 模块层叠顺序：后点的模块在最前。stack 存模块 id 数组，越靠后
+  // z 越高；点中/拖动/打开点选面板都会把模块提到最前，被压住的卡
+  // 点一下就能翻上来。
+  const [stack, setStack] = useState<number[]>([]);
+  useEffect(() => {
+    setStack((prev) => {
+      const ids = modules.map((m) => m.id);
+      const kept = prev.filter((id) => ids.includes(id));
+      const added = ids.filter((id) => !kept.includes(id));
+      return added.length === 0 && kept.length === prev.length
+        ? prev
+        : [...kept, ...added];
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [modules.map((m) => m.id).join(",")]);
+  const bringToFront = (id: number) => {
+    setStack((prev) =>
+      prev[prev.length - 1] === id ? prev : [...prev.filter((x) => x !== id), id],
+    );
+  };
+  const zOf = (id: number) => {
+    const i = stack.indexOf(id);
+    return 10 + (i >= 0 ? i : 0);
+  };
+
+  // 打开项目时按内容 fit 一次：能整张放下就整张放下，但缩放不低于
+  // 0.95（卡片不小于可读尺寸、44px 热区缩放后仍 ≥40px），放不下就以
+  // 0.95 定位到第一张卡靠平移看。每个项目只 fit 一次，用户之后自己
+  // 缩放/平移的不再被覆盖。
+  const fittedProjectsRef = useRef(new Set<number>());
+  useEffect(() => {
+    if (!canvasQ.data || modules.length === 0) return;
+    if (canvasMode !== "free") return; // 纵向流不缩放；切回自由画布时再 fit
+    const pid = canvasQ.data.projectId;
+    if (fittedProjectsRef.current.has(pid)) return;
+    if (focus && focusSeenRef.current !== focus.nonce) return; // 转入新链的定位优先
+    const rect = containerRef.current?.getBoundingClientRect();
+    if (!rect || rect.width < 50) return;
+    fittedProjectsRef.current.add(pid);
+    const minX = Math.min(...modules.map((m) => m.x));
+    const minY = Math.min(...modules.map((m) => m.y));
+    const maxX = Math.max(...modules.map((m) => m.x)) + CANVAS_MODULE_W;
+    const maxY = Math.max(...modules.map((m) => m.y)) + CANVAS_MODULE_H_EST;
+    const bw = maxX - minX;
+    const bh = maxY - minY;
+    let k = Math.min(
+      1.1,
+      (rect.width - 24) / Math.max(bw, 1),
+      (rect.height - 24) / Math.max(bh, 1),
+    );
+    if (k < 0.95) k = 0.95;
+    k = clampScale(k);
+    setView({
+      k,
+      x: Math.round(12 - minX * k),
+      y: Math.round(12 - minY * k),
+    });
+    // canvasMode 入依赖：从纵向流切回自由画布时也要补 fit 一次
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canvasQ.data, canvasMode]);
   const zoomAt = (cx: number, cy: number, factor: number) => {
     setView((v) => {
       const k2 = clampScale(v.k * factor);
@@ -3344,8 +3790,11 @@ function CanvasView({
     setLinkHover(null);
   };
 
-  // 整删确认：点模块右上角 ✕ 后先在模块顶部亮出确认条，确认才删
+  // 整删确认：点卡片「更多」里的「删除」后先在模块顶部亮出确认条，确认才删
   const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null);
+  // 卡片「更多」展开区：同一时间只开一张卡（两种模式共用一个状态），
+  // 调序/改步/存库/删除/备注都收在这里，卡面只留核心信息与一行操作
+  const [moreCardId, setMoreCardId] = useState<number | null>(null);
 
   // 加模块面板
   const [addOpen, setAddOpen] = useState(false);
@@ -3360,11 +3809,39 @@ function CanvasView({
     const rect = containerRef.current?.getBoundingClientRect();
     const w = rect?.width ?? 360;
     const h = rect?.height ?? 480;
-    const cascade = (modules.length % 6) * 28;
-    return {
-      x: Math.round((w / 2 - view.x) / view.k - CANVAS_MODULE_W / 2 + cascade),
-      y: Math.round((h / 2 - view.y) / view.k - 70 + cascade),
+    const base = {
+      x: Math.round((w / 2 - view.x) / view.k - CANVAS_MODULE_W / 2),
+      y: Math.round((h / 2 - view.y) / view.k - 90),
     };
+    // 新模块尽量落在空白处：从视口中心起按网格候选逐个试，
+    // 与已有模块矩形（宽 + 估算高，各留 16 间隔）不重叠的第一个胜出；
+    // 全试完都重叠就回到中心点（用户可拖动，点一下也会置顶）。
+    const overlaps = (x: number, y: number) =>
+      modules.some(
+        (m) =>
+          x < m.x + CANVAS_MODULE_W + 16 &&
+          x + CANVAS_MODULE_W + 16 > m.x &&
+          y < m.y + CANVAS_MODULE_H_EST + 16 &&
+          y + CANVAS_MODULE_H_EST + 16 > m.y,
+      );
+    if (!overlaps(base.x, base.y)) return base;
+    for (let ring = 1; ring <= 4; ring++) {
+      const dx = ring * (CANVAS_MODULE_W + 24);
+      const dy = ring * (CANVAS_MODULE_H_EST + 24);
+      const candidates = [
+        { x: base.x + dx, y: base.y },
+        { x: base.x - dx, y: base.y },
+        { x: base.x, y: base.y + dy },
+        { x: base.x, y: base.y - dy },
+        { x: base.x + dx, y: base.y + dy },
+        { x: base.x - dx, y: base.y + dy },
+      ];
+      for (const c of candidates) {
+        const cc = { x: Math.round(c.x), y: Math.round(c.y) };
+        if (!overlaps(cc.x, cc.y)) return cc;
+      }
+    }
+    return base;
   };
   const closeAdd = () => {
     setAddOpen(false);
@@ -3431,13 +3908,17 @@ function CanvasView({
   const modById = (id: number) => modules.find((m) => m.id === id);
 
   return (
-    <section aria-label="到站画布" className="mt-4">
-      <div className="flex items-center gap-2">
+    <section
+      aria-label="到站画布"
+      className="mt-2 flex flex-col"
+      style={{ height: "calc(100dvh - 11.5rem)", minHeight: 480 }}
+    >
+      <div className="flex shrink-0 items-center gap-2">
         <button
           type="button"
           onClick={onBack}
           aria-label="返回查车"
-          className="shrink-0 bg-[var(--surface2)] px-3 text-sm font-medium text-[var(--text)] [border-radius:8px]"
+          className="min-h-10 shrink-0 bg-[var(--surface2)] px-3 text-base font-medium text-[var(--text)] [border-radius:8px]"
         >
           ‹ 返回
         </button>
@@ -3448,80 +3929,262 @@ function CanvasView({
           type="button"
           onClick={() => (addOpen ? closeAdd() : setAddOpen(true))}
           aria-label="添加模块"
-          className="shrink-0 bg-[var(--accent)] px-3.5 font-bold text-[var(--accent-ink)] [border-radius:8px]"
+          className="min-h-10 shrink-0 bg-[var(--accent)] px-3.5 text-base font-bold text-[var(--accent-ink)] [border-radius:8px]"
         >
           {addOpen ? "收起" : "＋ 加模块"}
         </button>
       </div>
 
-      <div className="mt-2 flex flex-wrap items-center gap-2">
-        <button
-          type="button"
-          onClick={() => {
-            setLinkMode((on) => !on);
-            setLinkFrom(null);
-          }}
-          aria-pressed={linkMode}
-          className={`px-3 text-sm [border-radius:8px] ${
-            linkMode
-              ? "bg-[var(--accent)] font-bold text-[var(--accent-ink)]"
-              : "bg-[var(--surface2)] font-medium text-[var(--text)]"
-          }`}
+      {/* 页头第二行：当前项目名（点开切换列表）+ 模式切换 + ⋯ 菜单，
+          一行放下，不再有平铺按钮的胖项目栏 */}
+      <div className="mt-1.5 flex shrink-0 items-center gap-1.5">
+        {canvasQ.data && (
+          <button
+            type="button"
+            onClick={() => {
+              setProjectPanel(projectPanel === "switch" ? "none" : "switch");
+              setProjectError("");
+            }}
+            aria-expanded={projectPanel === "switch"}
+            aria-label={`当前项目「${currentProject?.name ?? ""}」，点我切换项目`}
+            className="flex min-h-10 max-w-36 min-w-0 shrink items-center gap-1 bg-[var(--surface)] px-2.5 text-base font-black text-[var(--text)] [border-radius:8px] border border-[var(--border)]"
+          >
+            <span className="min-w-0 truncate">{currentProject?.name ?? "…"}</span>
+            <span className="shrink-0 text-xs text-[var(--dim)]" aria-hidden="true">
+              ▾
+            </span>
+          </button>
+        )}
+        {/* 显示模式切换：自由画布 / 纵向流，按城市+项目记住选择；
+            模式说明已移入下方「操作说明」折叠区，这里不再占位 */}
+        <div
+          className="flex shrink-0 overflow-hidden border border-[var(--border)] [border-radius:8px]"
+          role="group"
+          aria-label="画布显示模式"
         >
-          {linkMode ? "连线中（点我退出）" : "连线"}
-        </button>
-        <span className="flex items-center gap-1">
           <button
             type="button"
-            onClick={() => zoomCenter(0.8)}
-            aria-label="缩小画布"
-            className="bg-[var(--surface2)] px-3 text-base font-bold text-[var(--text)] [border-radius:8px]"
+            onClick={() => switchMode("free")}
+            aria-pressed={canvasMode === "free"}
+            className={`min-h-10 px-3 text-sm ${
+              canvasMode === "free"
+                ? "bg-[var(--accent)] font-bold text-[var(--accent-ink)]"
+                : "bg-[var(--surface)] font-medium text-[var(--dim)]"
+            }`}
           >
-            −
-          </button>
-          <span className="min-w-12 text-center text-sm text-[var(--dim)]">
-            {Math.round(view.k * 100)}%
-          </span>
-          <button
-            type="button"
-            onClick={() => zoomCenter(1.25)}
-            aria-label="放大画布"
-            className="bg-[var(--surface2)] px-3 text-base font-bold text-[var(--text)] [border-radius:8px]"
-          >
-            ＋
+            自由画布
           </button>
           <button
             type="button"
-            onClick={() => setView({ x: 16, y: 16, k: 1 })}
-            className="bg-[var(--surface2)] px-3 text-sm font-medium text-[var(--text)] [border-radius:8px]"
+            onClick={() => switchMode("flow")}
+            aria-pressed={canvasMode === "flow"}
+            className={`min-h-10 px-3 text-sm ${
+              canvasMode === "flow"
+                ? "bg-[var(--accent)] font-bold text-[var(--accent-ink)]"
+                : "bg-[var(--surface)] font-medium text-[var(--dim)]"
+            }`}
           >
-            复位
+            纵向流
           </button>
-        </span>
+        </div>
+        <span className="min-w-0 flex-1" />
+        {canvasQ.data && (
+          <button
+            type="button"
+            onClick={() => {
+              setProjectPanel(projectPanel === "menu" ? "none" : "menu");
+              setProjectError("");
+            }}
+            aria-expanded={projectPanel === "menu"}
+            aria-label="项目管理菜单（新建、改名、删除）"
+            className="flex min-h-10 min-w-10 shrink-0 items-center justify-center bg-[var(--surface)] px-2 text-lg font-black text-[var(--text)] [border-radius:8px] border border-[var(--border)]"
+          >
+            ⋯
+          </button>
+        )}
       </div>
 
-      {linkMode && (
-        <p className="mt-2 text-sm text-[var(--accent)]" role="status">
-          {linkFrom === null
-            ? "点一个模块作起点，再点另一个模块，连线就画好了。（平时直接按住模块右侧的蓝点拖到另一个模块上也能连线）"
-            : "已选起点，再点另一个模块完成连线；点起点本身取消。点画布上的线可以删掉它。"}
-        </p>
+      {canvasQ.data && projectPanel === "switch" && (
+        <div
+          className="mt-1.5 flex shrink-0 flex-wrap items-center gap-1.5 border border-[var(--border)] bg-[var(--surface)] px-2.5 py-2 [border-radius:var(--radius)]"
+          role="group"
+          aria-label="切换画布项目"
+        >
+          {projects.map((p) => (
+            <button
+              key={p.id}
+              type="button"
+              onClick={() => switchProject(p.id)}
+              aria-pressed={p.id === curProjectId}
+              aria-label={`切换到项目「${p.name}」（${
+                p.moduleCount > 0 ? `${p.moduleCount} 张卡` : "空项目"
+              }）${p.id === curProjectId ? "，当前项目" : ""}`}
+              className={`min-h-10 shrink-0 px-3 text-sm whitespace-nowrap [border-radius:8px] ${
+                p.id === curProjectId
+                  ? "bg-[var(--accent)] font-bold text-[var(--accent-ink)]"
+                  : "bg-[var(--surface2)] font-medium text-[var(--text)]"
+              }`}
+            >
+              {p.id === curProjectId ? "✓ " : ""}
+              {p.name}
+              <span className="opacity-75">
+                {p.moduleCount > 0 ? ` · ${p.moduleCount} 张卡` : " · 空"}
+              </span>
+            </button>
+          ))}
+        </div>
       )}
 
-      {templateFlash && (
-        <p className="mt-2 text-sm font-medium text-[var(--accent)]" role="status">
-          {templateFlash}
-        </p>
+      {canvasQ.data && projectPanel === "menu" && (
+        <div
+          className="mt-1.5 flex shrink-0 items-center gap-1.5 border border-[var(--border)] bg-[var(--surface)] px-2.5 py-2 [border-radius:var(--radius)]"
+          role="group"
+          aria-label="项目管理"
+        >
+          <button
+            type="button"
+            onClick={() => {
+              setProjectPanel("create");
+              setProjectNameInput("");
+              setProjectError("");
+            }}
+            className="min-h-10 shrink-0 border border-dashed border-[var(--accent)] px-3 text-sm font-bold whitespace-nowrap text-[var(--accent)] [border-radius:8px]"
+          >
+            ＋ 新建项目
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setProjectPanel("rename");
+              setProjectNameInput(currentProject?.name ?? "");
+              setProjectError("");
+            }}
+            className="min-h-10 shrink-0 bg-[var(--surface2)] px-3 text-sm font-medium text-[var(--text)] [border-radius:8px]"
+          >
+            改名
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setProjectPanel("delete");
+              setProjectError("");
+            }}
+            className="min-h-10 shrink-0 bg-[var(--surface2)] px-3 text-sm font-medium text-[var(--danger)] [border-radius:8px]"
+          >
+            删除项目
+          </button>
+        </div>
       )}
+
+      {canvasQ.data &&
+        (projectPanel === "create" ||
+          projectPanel === "rename" ||
+          projectPanel === "delete" ||
+          projectError) && (
+        <div className="mt-1.5 shrink-0 border border-[var(--border)] bg-[var(--surface)] px-2.5 py-2 [border-radius:var(--radius)]">
+          {projectPanel === "create" && (
+            <form
+              className="flex gap-2"
+              onSubmit={(e) => {
+                e.preventDefault();
+                const n = projectNameInput.trim();
+                if (n) createProjectMut.mutate(n);
+              }}
+            >
+              <input
+                className={inputCls}
+                value={projectNameInput}
+                onChange={(e) => setProjectNameInput(e.target.value)}
+                placeholder="给新项目起个名，如：上班、下班、去同安"
+                aria-label="新项目名称"
+                maxLength={30}
+                autoComplete="off"
+              />
+              <button
+                type="submit"
+                className={submitCls}
+                disabled={!projectNameInput.trim() || createProjectMut.isPending}
+              >
+                {createProjectMut.isPending ? "建中…" : "建好并切换"}
+              </button>
+            </form>
+          )}
+          {projectPanel === "rename" && (
+            <form
+              className="flex gap-2"
+              onSubmit={(e) => {
+                e.preventDefault();
+                const n = projectNameInput.trim();
+                if (n && curProjectId > 0) {
+                  renameProjectMut.mutate({ id: curProjectId, name: n });
+                }
+              }}
+            >
+              <input
+                className={inputCls}
+                value={projectNameInput}
+                onChange={(e) => setProjectNameInput(e.target.value)}
+                placeholder="新的项目名，如：上班"
+                aria-label="当前项目的新名称"
+                maxLength={30}
+                autoComplete="off"
+              />
+              <button
+                type="submit"
+                className={submitCls}
+                disabled={!projectNameInput.trim() || renameProjectMut.isPending}
+              >
+                {renameProjectMut.isPending ? "改中…" : "保存新名"}
+              </button>
+            </form>
+          )}
+          {projectPanel === "delete" && (
+            <div className="border border-[var(--danger)] px-3 py-2.5 [border-radius:8px]">
+              <p className="text-sm leading-relaxed text-[var(--text)]">
+                删除项目「{currentProject?.name}」会连带删掉里面的{" "}
+                {modules.length} 个模块和 {links.length}{" "}
+                条连线，删了不能恢复。模块库里的模板不受影响。
+              </p>
+              <div className="mt-2 flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (curProjectId > 0) deleteProjectMut.mutate(curProjectId);
+                  }}
+                  disabled={deleteProjectMut.isPending}
+                  aria-label={`确认删除项目「${currentProject?.name ?? ""}」`}
+                  className="bg-[var(--danger)] px-3.5 font-bold text-white [border-radius:8px] disabled:opacity-50"
+                >
+                  {deleteProjectMut.isPending ? "删除中…" : "确认删除"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setProjectPanel("none")}
+                  className="bg-[var(--surface2)] px-3.5 font-medium text-[var(--text)] [border-radius:8px]"
+                >
+                  取消
+                </button>
+              </div>
+            </div>
+          )}
+          {projectError && (
+            <p className="mt-2 text-sm text-[var(--danger)]" role="alert">
+              {projectError}
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* 工具栏（连线/缩放/复位）已改为浮在画布左上角，不再单独占一行 */}
 
       {addOpen && (
-        <div className="mt-3 border border-[var(--border)] bg-[var(--surface)] px-4 py-3.5 [border-radius:var(--radius)]">
+        <div className="mt-2 max-h-[48dvh] shrink-0 overflow-y-auto border border-[var(--border)] bg-[var(--surface)] px-4 py-3.5 [border-radius:var(--radius)]">
           <div className="flex gap-2" role="group" aria-label="选择模块类型">
             <button
               type="button"
               onClick={() => setAddKind("station")}
               aria-pressed={addKind === "station"}
-              className={`px-3.5 text-sm [border-radius:8px] ${
+              className={`min-h-11 px-4 text-base [border-radius:8px] ${
                 addKind === "station"
                   ? "bg-[var(--accent)] font-bold text-[var(--accent-ink)]"
                   : "bg-[var(--surface2)] font-medium text-[var(--text)]"
@@ -3533,7 +4196,7 @@ function CanvasView({
               type="button"
               onClick={() => setAddKind("text")}
               aria-pressed={addKind === "text"}
-              className={`px-3.5 text-sm [border-radius:8px] ${
+              className={`min-h-11 px-4 text-base [border-radius:8px] ${
                 addKind === "text"
                   ? "bg-[var(--accent)] font-bold text-[var(--accent-ink)]"
                   : "bg-[var(--surface2)] font-medium text-[var(--text)]"
@@ -3640,7 +4303,7 @@ function CanvasView({
                         type="button"
                         onClick={() => setDirIdx(i)}
                         aria-pressed={dirIdx === i}
-                        className={`px-3 py-1.5 text-sm [border-radius:8px] ${
+                        className={`min-h-11 px-3.5 text-base [border-radius:8px] ${
                           dirIdx === i
                             ? "bg-[var(--accent)] font-bold text-[var(--accent-ink)]"
                             : "bg-[var(--surface2)] font-medium text-[var(--text)]"
@@ -3659,7 +4322,7 @@ function CanvasView({
                         onClick={() => addStationModule(s)}
                         disabled={addModuleMut.isPending}
                         aria-label={`添加 ${ldMut.data.line} 在 ${s} 的到站卡`}
-                        className="bg-[var(--surface2)] px-2.5 py-1.5 text-sm text-[var(--text)] [border-radius:8px] disabled:opacity-50"
+                        className="min-h-11 bg-[var(--surface2)] px-3.5 py-2 text-base text-[var(--text)] [border-radius:8px] disabled:opacity-50"
                       >
                         {s}
                       </button>
@@ -3679,7 +4342,7 @@ function CanvasView({
               </p>
             ) : templates.length === 0 ? (
               <p className="mt-1.5 text-sm leading-relaxed text-[var(--dim)]">
-                还没有存过的模块。在画布上把一张卡配好，点卡上的「存库」，它就存到这里；下次点这里任意一条，直接在画布上放一份，不用再填一遍。
+                还没有存过的模块。在画布上把一张卡配好，点卡片「更多」里的「存库」，它就存到这里；下次点这里任意一条，直接在画布上放一份，不用再填一遍。
               </p>
             ) : (
               <ul className="mt-2 space-y-1.5">
@@ -3690,7 +4353,7 @@ function CanvasView({
                       onClick={() => placeTemplate(t)}
                       disabled={addModuleMut.isPending}
                       aria-label={`把模块「${templateSummary(t)}」放到画布上`}
-                      className="min-w-0 flex-1 truncate bg-[var(--surface2)] px-3 py-2 text-left text-sm font-medium text-[var(--text)] [border-radius:8px] disabled:opacity-50"
+                      className="min-h-11 min-w-0 flex-1 truncate bg-[var(--surface2)] px-3 py-2.5 text-left text-base font-medium text-[var(--text)] [border-radius:8px] disabled:opacity-50"
                     >
                       {templateSummary(t)}
                       {t.note && (
@@ -3723,8 +4386,8 @@ function CanvasView({
                         type="button"
                         onClick={() => setConfirmTemplateId(t.id)}
                         aria-label={`从模块库删除「${templateSummary(t)}」`}
-                        className="flex shrink-0 items-center justify-center border border-[var(--border)] bg-[var(--surface)] px-2 text-base leading-none font-bold text-[var(--danger)] [border-radius:8px]"
-                        style={{ width: 36 }}
+                        className="flex min-h-11 shrink-0 items-center justify-center border border-[var(--border)] bg-[var(--surface)] px-2 text-base leading-none font-bold text-[var(--danger)] [border-radius:8px]"
+                        style={{ width: 44 }}
                       >
                         ✕
                       </button>
@@ -3751,17 +4414,84 @@ function CanvasView({
         </div>
       )}
 
-      {canvasQ.data && (
+      {canvasQ.data && canvasMode === "free" && (
         <div
           ref={containerRef}
           role="application"
           aria-label={`${city}到站画布：拖空白处平移，拖模块移动模块，双指或滚轮缩放`}
-          className="relative mt-3 h-[62dvh] min-h-[420px] touch-none overflow-hidden border border-[var(--border)] bg-[var(--surface2)] [border-radius:var(--radius)]"
+          className="relative mt-2 min-h-0 flex-1 touch-none overflow-hidden border border-[var(--border)] bg-[var(--surface2)] [border-radius:var(--radius)]"
           onPointerDown={onBgPointerDown}
           onPointerMove={onBgPointerMove}
           onPointerUp={endPointer}
           onPointerCancel={endPointer}
         >
+          {/* 浮动工具栏：连线/缩放/复位压成一行小栏浮在画布左上角，
+              不再单独占高度；按钮热区 ≥40px */}
+          <div className="absolute top-2 left-2 z-40 flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => {
+                setLinkMode((on) => !on);
+                setLinkFrom(null);
+              }}
+              aria-pressed={linkMode}
+              className={`min-h-10 px-3.5 text-sm shadow [border-radius:8px] ${
+                linkMode
+                  ? "bg-[var(--accent)] font-bold text-[var(--accent-ink)]"
+                  : "bg-[var(--surface)] font-medium text-[var(--text)]"
+              }`}
+            >
+              {linkMode ? "连线中" : "连线"}
+            </button>
+            <button
+              type="button"
+              onClick={() => zoomCenter(0.8)}
+              aria-label="缩小画布"
+              className="min-h-10 min-w-10 bg-[var(--surface)] px-2 text-lg font-bold text-[var(--text)] shadow [border-radius:8px]"
+            >
+              −
+            </button>
+            <span className="min-w-11 bg-[var(--surface)] px-1 py-2 text-center text-sm text-[var(--dim)] shadow [border-radius:8px]">
+              {Math.round(view.k * 100)}%
+            </span>
+            <button
+              type="button"
+              onClick={() => zoomCenter(1.25)}
+              aria-label="放大画布"
+              className="min-h-10 min-w-10 bg-[var(--surface)] px-2 text-lg font-bold text-[var(--text)] shadow [border-radius:8px]"
+            >
+              ＋
+            </button>
+            <button
+              type="button"
+              onClick={() => setView({ x: 16, y: 16, k: 1 })}
+              className="min-h-10 bg-[var(--surface)] px-3 text-sm font-medium text-[var(--text)] shadow [border-radius:8px]"
+            >
+              复位
+            </button>
+          </div>
+          {(linkMode || templateFlash) && (
+            <div className="pointer-events-none absolute right-2 bottom-2 left-2 z-40">
+              {linkMode && (
+                <p
+                  className="bg-[var(--surface)] px-3 py-2 text-sm text-[var(--accent)] shadow [border-radius:8px]"
+                  role="status"
+                >
+                  {linkFrom === null
+                    ? "点一个模块作起点，再点另一个模块完成连线；点画布上的线可删线。（平时按住模块右侧蓝点拖到另一个模块上也能连线）"
+                    : "已选起点，再点另一个模块完成连线；点起点本身取消。"}
+                </p>
+              )}
+              {templateFlash && (
+                <p
+                  className="mt-1.5 bg-[var(--surface)] px-3 py-2 text-sm font-medium text-[var(--accent)] shadow [border-radius:8px]"
+                  role="status"
+                >
+                  {templateFlash}
+                </p>
+              )}
+            </div>
+          )}
           <div
             className="absolute top-0 left-0"
             style={{
@@ -3876,14 +4606,15 @@ function CanvasView({
                 <div
                   key={m.id}
                   data-canvas-module={m.id}
-                  className={`absolute touch-none border bg-[var(--surface)] px-3 py-2.5 shadow-sm [border-radius:var(--radius)] ${
+                  className={`absolute touch-none border bg-[var(--surface)] px-3.5 py-3 shadow-sm [border-radius:var(--radius)] ${
                     isFrom || isLinkTarget
                       ? "border-2 border-[var(--accent)]"
                       : "border-[var(--border)]"
                   } ${linkMode ? "cursor-pointer" : "cursor-grab"} ${
                     stopped ? "opacity-75 saturate-50" : ""
                   }`}
-                  style={{ left: p.x, top: p.y, width: CANVAS_MODULE_W }}
+                  style={{ left: p.x, top: p.y, width: CANVAS_MODULE_W, zIndex: zOf(m.id) }}
+                  onPointerDownCapture={() => bringToFront(m.id)}
                   onPointerDown={(e) => {
                     // 模块上的按钮/输入框优先于连线点选与拖动
                     if ((e.target as HTMLElement).closest("button,input,textarea")) return;
@@ -3933,22 +4664,25 @@ function CanvasView({
                     }
                   }}
                 >
-                  {/* 整删：右上角明确的 ✕，点后先确认一次 */}
-                  <button
-                    type="button"
-                    onClick={() => setConfirmDeleteId(m.id)}
-                    aria-label={`删除模块 ${modLabel}`}
-                    className="absolute -top-3 -right-3 z-20 flex min-h-0 items-center justify-center border border-[var(--border)] bg-[var(--surface)] text-base leading-none font-bold text-[var(--danger)] shadow [border-radius:999px]"
-                    style={{ width: 36, height: 36 }}
-                  >
-                    ✕
-                  </button>
+                  {/* 整删入口已收进卡片「更多」展开区（点删除后仍先出确认条） */}
+                  {/* 步骤徽章：同一步的卡是备选方案，徽章标步号与方案字母 */}
+                  {(() => {
+                    const info = stepInfoById.get(m.id);
+                    if (!info) return null;
+                    return (
+                      <span className="absolute -top-3 left-3 z-20 border border-[var(--border)] bg-[var(--surface2)] px-2 py-0.5 text-xs font-black whitespace-nowrap text-[var(--text)] shadow [border-radius:999px]">
+                        第{info.ordinal}步
+                        {info.groupSize > 1 &&
+                          ` · 方案${String.fromCharCode(65 + info.inGroup)}`}
+                      </span>
+                    );
+                  })()}
                   {/* 连线连接点：按住拖出虚线、落到另一个模块上成线 */}
                   <button
                     type="button"
                     aria-label={`从 ${modLabel} 拖出连线`}
-                    className="absolute top-1/2 -right-3.5 z-20 min-h-0 -translate-y-1/2 border-2 border-[var(--surface)] bg-[var(--accent)] shadow [border-radius:999px]"
-                    style={{ width: 26, height: 26, touchAction: "none" }}
+                    className="absolute top-1/2 -right-5 z-20 min-h-0 -translate-y-1/2 border-2 border-[var(--surface)] bg-[var(--accent)] shadow [border-radius:999px]"
+                    style={{ width: 44, height: 44, touchAction: "none" }}
                     onPointerDown={(e) => onPortPointerDown(e, m)}
                     onPointerMove={onPortPointerMove}
                     onPointerUp={onPortPointerUp}
@@ -3956,7 +4690,7 @@ function CanvasView({
                   />
                   {confirmDeleteId === m.id && (
                     <div className="absolute inset-x-0 -top-1 z-30 border border-[var(--danger)] bg-[var(--surface)] px-2.5 py-2 shadow [border-radius:8px]">
-                      <p className="text-xs text-[var(--text)]">
+                      <p className="text-sm text-[var(--text)]">
                         删除这个模块？连着它的线也会一起删。
                       </p>
                       <div className="mt-1.5 flex gap-1.5">
@@ -3967,14 +4701,14 @@ function CanvasView({
                             removeModuleMut.mutate(m.id);
                           }}
                           aria-label={`确认删除模块 ${modLabel}`}
-                          className="flex-1 border border-[var(--danger)] bg-[var(--surface)] px-2 text-xs font-bold text-[var(--danger)] [border-radius:6px]"
+                          className="min-h-10 flex-1 border border-[var(--danger)] bg-[var(--surface)] px-2 text-sm font-bold text-[var(--danger)] [border-radius:6px]"
                         >
                           删除
                         </button>
                         <button
                           type="button"
                           onClick={() => setConfirmDeleteId(null)}
-                          className="flex-1 bg-[var(--surface2)] px-2 text-xs font-medium text-[var(--text)] [border-radius:6px]"
+                          className="min-h-10 flex-1 bg-[var(--surface2)] px-2 text-sm font-medium text-[var(--text)] [border-radius:6px]"
                         >
                           取消
                         </button>
@@ -4011,6 +4745,11 @@ function CanvasView({
                       onSetDirection={(direction, terminal) =>
                         updateModuleMut.mutate({ id: m.id, direction, terminal })
                       }
+                      moreOpen={moreCardId === m.id}
+                      onToggleMore={() =>
+                        setMoreCardId(moreCardId === m.id ? null : m.id)
+                      }
+                      onDeleteRequest={() => setConfirmDeleteId(m.id)}
                     />
                   ) : (
                     <CanvasTextCard
@@ -4022,6 +4761,11 @@ function CanvasView({
                       onSaveTemplate={() => saveTemplateMut.mutate(m)}
                       saveTemplatePending={saveTemplateMut.isPending}
                       onSaveText={(text) => updateModuleMut.mutate({ id: m.id, text })}
+                      moreOpen={moreCardId === m.id}
+                      onToggleMore={() =>
+                        setMoreCardId(moreCardId === m.id ? null : m.id)
+                      }
+                      onDeleteRequest={() => setConfirmDeleteId(m.id)}
                     />
                   )}
                 </div>
@@ -4029,7 +4773,7 @@ function CanvasView({
             })}
 
             {modules.length === 0 && (
-              <p className="absolute top-24 left-1/2 w-64 -translate-x-1/2 text-center text-sm leading-relaxed text-[var(--dim)]">
+              <p className="absolute top-24 left-1/2 w-72 -translate-x-1/2 text-center text-base leading-relaxed text-[var(--dim)]">
                 画布还是空的。点上面「＋ 加模块」，可以直接放一张空白到站卡自己填，也可以查线路选站加卡，再加文本卡、连线，一个个摆出你的路线图。
               </p>
             )}
@@ -4037,46 +4781,309 @@ function CanvasView({
         </div>
       )}
 
-      <p className="mt-2 text-xs leading-relaxed text-[var(--dim)]">
-        拖模块本体移动它，拖空白处平移画布，双指或滚轮缩放。连线：按住模块右侧的蓝点拖到另一个模块上松手（虚线带箭头，按顺序连就是行程顺序）；模块右上角 ✕ 整删。到站卡可开始/停止：停止后变灰待机、不查车。打开画布不自动查车：有缓存先看缓存，每张到站卡点刷新只查它自己。到站卡前三行（站名/线路/方向）点一下先出可选项点选——方向是终点站二选一、站名从站序里挑、线路从你用过的里面挑，实在没有选项才打字，选完自动保存；「＋ 加模块」里可以直接放一张空白卡，不用先查线路。配好的模块点卡上的「存库」存入模块库，之后在「＋ 加模块 → 我的模块库」点一下就放一份副本到画布上，副本和模板互不影响。
-      </p>
+      {canvasQ.data && canvasMode === "flow" && (
+        <div
+          className="mt-2 min-h-0 flex-1 overflow-y-auto"
+          aria-label={`${city}到站纵向流：按连线顺序从上往下排列的大卡`}
+        >
+          {templateFlash && (
+            <p className="mb-2 px-1 text-sm font-medium text-[var(--accent)]" role="status">
+              {templateFlash}
+            </p>
+          )}
+          {modules.length === 0 && (
+            <p className="px-2 py-10 text-center text-base leading-relaxed text-[var(--dim)]">
+              还没有模块。点上面「＋ 加模块」放一张空白到站卡，或从模块库调用、从规划转进来，第一张卡就会出现在这里。
+            </p>
+          )}
+          {stepGroups.map((sg, gi) => (
+            <div key={`s${sg.step}-${sg.entries[0]?.mod.id ?? 0}`}>
+              {gi > 0 && (
+                <div
+                  className="flex flex-col items-center py-1.5"
+                  aria-hidden="true"
+                >
+                  <span className="h-5 border-l-[3px] border-dashed border-[var(--accent)]" />
+                  <span className="-mt-1.5 text-2xl leading-none font-black text-[var(--accent)]">
+                    ↓
+                  </span>
+                </div>
+              )}
+              <div className="flex items-baseline gap-2 px-1 pt-1 pb-2">
+                <span className="text-lg font-black text-[var(--text)]">
+                  第 {gi + 1} 步
+                </span>
+                {sg.entries.length > 1 && (
+                  <span className="text-sm font-medium text-[var(--amber)]">
+                    · {sg.entries.length} 个方案，任选其一
+                  </span>
+                )}
+              </div>
+              {sg.entries.map((e, ei) => {
+                const m = e.mod;
+                const g = e.group;
+                const idx = e.idx;
+                const seqIdx = flowSeq.indexOf(e);
+                const prevEntry = seqIdx > 0 ? flowSeq[seqIdx - 1] : undefined;
+                const canMerge =
+                  !!prevEntry && prevEntry.mod.stepIndex !== m.stepIndex;
+                const stopped = m.kind === "station" && !m.enabled;
+                const modLabel =
+                  m.kind === "station" ? `${m.line} ${m.station}` : `文本卡 ${m.text}`;
+                // 流模式的调序/改步控件：不再常驻卡面，收进卡片「更多」
+                // 展开区（flowTools 传入卡片组件，点开才显示）
+                const flowTools = (
+                  <>
+                    {g.chain && g.modules.length > 1 && (
+                      <div className="mt-2 flex items-center gap-2">
+                        <button
+                          type="button"
+                          disabled={idx === 0 || reorderMut.isPending}
+                          onClick={() =>
+                            reorderMut.mutate({ group: g, from: idx, to: idx - 1 })
+                          }
+                          aria-label={`把模块 ${modLabel} 上移一位`}
+                          className="min-h-10 flex-1 bg-[var(--surface2)] px-3 text-base font-bold text-[var(--text)] [border-radius:8px] disabled:opacity-40"
+                        >
+                          ↑ 上移
+                        </button>
+                        <span className="shrink-0 text-sm text-[var(--dim)]">
+                          {idx + 1} / {g.modules.length}
+                        </span>
+                        <button
+                          type="button"
+                          disabled={idx === g.modules.length - 1 || reorderMut.isPending}
+                          onClick={() =>
+                            reorderMut.mutate({ group: g, from: idx, to: idx + 1 })
+                          }
+                          aria-label={`把模块 ${modLabel} 下移一位`}
+                          className="min-h-10 flex-1 bg-[var(--surface2)] px-3 text-base font-bold text-[var(--text)] [border-radius:8px] disabled:opacity-40"
+                        >
+                          ↓ 下移
+                        </button>
+                      </div>
+                    )}
+                    <div className="mt-2 flex flex-wrap items-center gap-2 border-t border-[var(--border)] pt-2">
+                      <span className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          disabled={stepBusy || m.stepIndex <= 1}
+                          onClick={() =>
+                            setStepMut.mutate([
+                              { id: m.id, stepIndex: m.stepIndex - 1 },
+                            ])
+                          }
+                          aria-label={`把模块 ${modLabel} 的步号减一`}
+                          className="flex min-h-10 min-w-10 items-center justify-center bg-[var(--surface2)] px-2 text-lg font-black text-[var(--text)] [border-radius:8px] disabled:opacity-40"
+                        >
+                          −
+                        </button>
+                        <span className="px-0.5 text-base font-bold whitespace-nowrap text-[var(--text)]">
+                          第 {gi + 1} 步
+                        </span>
+                        <button
+                          type="button"
+                          disabled={
+                            stepBusy ||
+                            (m.stepIndex >= maxStepIndex && sg.entries.length === 1)
+                          }
+                          onClick={() =>
+                            setStepMut.mutate([
+                              { id: m.id, stepIndex: m.stepIndex + 1 },
+                            ])
+                          }
+                          aria-label={`把模块 ${modLabel} 的步号加一`}
+                          className="flex min-h-10 min-w-10 items-center justify-center bg-[var(--surface2)] px-2 text-lg font-black text-[var(--text)] [border-radius:8px] disabled:opacity-40"
+                        >
+                          +
+                        </button>
+                      </span>
+                      {canMerge && (
+                        <button
+                          type="button"
+                          disabled={stepBusy}
+                          onClick={() => mergeWithPrev(seqIdx)}
+                          aria-label={`把模块 ${modLabel} 并入上一步作为备选方案`}
+                          className="min-h-10 flex-1 bg-[var(--surface2)] px-3 text-sm font-bold whitespace-nowrap text-[var(--text)] [border-radius:8px] disabled:opacity-40"
+                        >
+                          与上一张同一步
+                        </button>
+                      )}
+                      {sg.entries.length > 1 && (
+                        <button
+                          type="button"
+                          disabled={stepBusy}
+                          onClick={() => splitToOwnStep(e)}
+                          aria-label={`把模块 ${modLabel} 拆出来独立成下一步`}
+                          className="min-h-10 flex-1 bg-[var(--surface2)] px-3 text-sm font-bold whitespace-nowrap text-[var(--text)] [border-radius:8px] disabled:opacity-40"
+                        >
+                          独立成下一步
+                        </button>
+                      )}
+                    </div>
+                  </>
+                );
+                return (
+                  <div key={m.id}>
+                    {ei > 0 && (
+                      <div
+                        className="flex items-center justify-center py-1.5"
+                        aria-hidden="true"
+                      >
+                        <span className="border border-[var(--amber)] bg-[var(--amber-bg)] px-3 py-0.5 text-sm font-black text-[var(--amber)] [border-radius:999px]">
+                          或
+                        </span>
+                      </div>
+                    )}
+                    <div
+                      className={`relative border bg-[var(--surface)] px-3.5 py-3 shadow-sm [border-radius:var(--radius)] ${
+                        stopped ? "opacity-75 saturate-50" : ""
+                      } border-[var(--border)]`}
+                    >
+                      {/* 整删入口已收进卡片「更多」展开区（点删除后仍先出确认条） */}
+                      {confirmDeleteId === m.id && (
+                        <div className="absolute inset-x-2 top-2 z-30 border border-[var(--danger)] bg-[var(--surface)] px-3 py-2.5 shadow [border-radius:8px]">
+                          <p className="text-sm text-[var(--text)]">
+                            删除这个模块？连着它的线也会一起删。
+                          </p>
+                          <div className="mt-2 flex gap-2">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setConfirmDeleteId(null);
+                                removeModuleMut.mutate(m.id);
+                              }}
+                              aria-label={`确认删除模块 ${modLabel}`}
+                              className="min-h-11 flex-1 border border-[var(--danger)] bg-[var(--surface)] px-2 text-sm font-bold text-[var(--danger)] [border-radius:8px]"
+                            >
+                              删除
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setConfirmDeleteId(null)}
+                              className="min-h-11 flex-1 bg-[var(--surface2)] px-2 text-sm font-medium text-[var(--text)] [border-radius:8px]"
+                            >
+                              取消
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                      {m.kind === "station" ? (
+                        <CanvasStationCard
+                          mod={m}
+                          city={city}
+                          entry={entryOf(m.id)}
+                          onSaveTemplate={() => saveTemplateMut.mutate(m)}
+                          saveTemplatePending={saveTemplateMut.isPending}
+                          onSaveNote={(note) => updateModuleMut.mutate({ id: m.id, note })}
+                          onSaveStation={(station) =>
+                            updateModuleMut.mutate({ id: m.id, station })
+                          }
+                          onSaveLine={(line) =>
+                            updateModuleMut.mutate({
+                              id: m.id,
+                              line,
+                              direction: 0,
+                              terminal: "",
+                            })
+                          }
+                          onToggleEnabled={(enabled) =>
+                            updateModuleMut.mutate({ id: m.id, enabled })
+                          }
+                          onSetDirection={(direction, terminal) =>
+                            updateModuleMut.mutate({ id: m.id, direction, terminal })
+                          }
+                          moreOpen={moreCardId === m.id}
+                          onToggleMore={() =>
+                            setMoreCardId(moreCardId === m.id ? null : m.id)
+                          }
+                          onDeleteRequest={() => setConfirmDeleteId(m.id)}
+                          flowTools={flowTools}
+                        />
+                      ) : (
+                        <CanvasTextCard
+                          mod={m}
+                          onSaveTemplate={() => saveTemplateMut.mutate(m)}
+                          saveTemplatePending={saveTemplateMut.isPending}
+                          onSaveText={(text) => updateModuleMut.mutate({ id: m.id, text })}
+                          moreOpen={moreCardId === m.id}
+                          onToggleMore={() =>
+                            setMoreCardId(moreCardId === m.id ? null : m.id)
+                          }
+                          onDeleteRequest={() => setConfirmDeleteId(m.id)}
+                          flowTools={flowTools}
+                        />
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <details className="mt-1.5 shrink-0">
+        <summary className="min-h-8 cursor-pointer text-sm text-[var(--dim)]">
+          操作说明（点开看）
+        </summary>
+        <p className="pb-1 text-xs leading-relaxed text-[var(--dim)]">
+          两种看法：自由画布自由拖动摆布，拖模块本体移动它（点中或拖动的模块会自动翻到最前），拖空白处平移画布，双指或滚轮缩放；纵向流按步从上往下全宽排开——同一步多卡是备选（或），步间是先后（向下的大箭头），卡上的 ↑↓ 换位会把连线顺序一并改好，切回自由画布时模块位置不变。卡面只留核心信息（站名/线路/方向/第 1 班/第 2 班/数据时间）和一行操作（开始/停止、点查、更多）；调序、改步、存库、删除、备注都收在卡片的「更多」里，点开才显示，一次只开一张。步骤：行程按「第 X 步」分组，同一步里的多张卡是备选方案（中间标「或」，任选其一）；在「更多」里能改步——「与上一张同一步」把卡并入上一步当备选、「独立成下一步」把卡拆出来自己一步，也能用 −/+ 直接改步号（与相邻步同号即并入那一步）；↑↓ 跨步换位时两张卡互换步号，步的分组大小不变。自由画布里每张卡左上角有步号徽章，同一步多卡标方案A/B/C。连线：按住模块右侧的蓝点拖到另一个模块上松手（虚线带箭头，按顺序连就是行程顺序）；整删在卡片「更多」里点「删除」（会先确认一次）。到站卡可开始/停止：停止后变灰待机、不查车。打开画布不自动查车：有缓存先看缓存，每张到站卡点刷新只查它自己。到站卡前三行（站名/线路/方向）点一下先出可选项点选——方向行点 ◀ ▶ 直接在两个终点站之间切换、点方向文字出终点站二选一，站名从站序里挑、线路从你用过的里面挑，实在没有选项才打字，选完自动保存；「＋ 加模块」里可以直接放一张空白卡，不用先查线路。配好的模块点卡片「更多」里的「存库」存入模块库，之后在「＋ 加模块 → 我的模块库」点一下就放一份副本到画布上，副本和模板互不影响。页头点项目名可以切换项目，「⋯」菜单里新建、改名、删除项目。项目里的模块、连线、位置改完即存，切走再回来原样恢复。
+        </p>
+      </details>
     </section>
   );
 }
 
-function CanvasCardActions({
+// 卡片「更多」展开区里的次要操作：存库 / 连线（仅自由画布）/ 删除。
+// 卡面瘦身后这些不再常驻，由卡片的「更多」按钮点开才显示；删除仍走
+// 外层已有的确认条（onDeleteRequest 只是提出请求）。
+function CanvasCardMoreTools({
   label,
   onStartLink,
   onSaveTemplate,
   saveTemplatePending,
+  onDeleteRequest,
 }: {
   label: string;
-  onStartLink: () => void;
+  // 纵向流模式不传 onStartLink：流模式里顺序由链与 ↑↓ 决定，不显示「连线」
+  onStartLink?: () => void;
   onSaveTemplate?: () => void;
   saveTemplatePending?: boolean;
+  onDeleteRequest: () => void;
 }) {
   return (
-    <span className="flex shrink-0 items-center gap-1">
+    <div className="flex flex-wrap items-center gap-1.5">
       {onSaveTemplate && (
         <button
           type="button"
           onClick={onSaveTemplate}
           disabled={saveTemplatePending}
           aria-label={`把${label}存入模块库`}
-          className="shrink-0 bg-[var(--surface2)] px-2 py-0.5 text-xs font-medium text-[var(--accent)] [border-radius:999px] disabled:opacity-50"
+          className="min-h-10 flex-1 bg-[var(--surface2)] px-3 text-sm font-bold whitespace-nowrap text-[var(--accent)] [border-radius:8px] disabled:opacity-50"
         >
           {saveTemplatePending ? "存入中…" : "存库"}
         </button>
       )}
+      {onStartLink && (
+        <button
+          type="button"
+          onClick={onStartLink}
+          aria-label={`从${label}开始连线`}
+          className="min-h-10 flex-1 bg-[var(--surface2)] px-3 text-sm font-bold whitespace-nowrap text-[var(--accent)] [border-radius:8px]"
+        >
+          连线
+        </button>
+      )}
       <button
         type="button"
-        onClick={onStartLink}
-        aria-label={`从${label}开始连线`}
-        className="shrink-0 bg-[var(--surface2)] px-2 py-0.5 text-xs font-medium text-[var(--accent)] [border-radius:999px]"
+        onClick={onDeleteRequest}
+        aria-label={`删除${label}`}
+        className="min-h-10 flex-1 bg-[var(--surface2)] px-3 text-sm font-bold whitespace-nowrap text-[var(--danger)] [border-radius:8px]"
       >
-        连线
+        删除
       </button>
-    </span>
+    </div>
   );
 }
 
@@ -4092,11 +5099,15 @@ function CanvasStationCard({
   onSaveLine,
   onToggleEnabled,
   onSetDirection,
+  moreOpen,
+  onToggleMore,
+  onDeleteRequest,
+  flowTools,
 }: {
   mod: CanvasModule;
   city: string;
   entry: BoardEntry | undefined;
-  onStartLink: () => void;
+  onStartLink?: () => void;
   onSaveTemplate: () => void;
   saveTemplatePending: boolean;
   onSaveNote: (note: string) => void;
@@ -4104,6 +5115,12 @@ function CanvasStationCard({
   onSaveLine: (line: string) => void;
   onToggleEnabled: (enabled: boolean) => void;
   onSetDirection: (direction: number, terminal: string) => void;
+  // 「更多」展开区：同一时间只开一张卡（状态在 CanvasView 里）
+  moreOpen: boolean;
+  onToggleMore: () => void;
+  onDeleteRequest: () => void;
+  // 纵向流的调序/改步控件，由流渲染处传入、只在展开区里显示
+  flowTools?: ReactNode;
 }) {
   const stopped = !mod.enabled;
   const rtM = useMutation({
@@ -4126,11 +5143,6 @@ function CanvasStationCard({
         data?.directions[0] ??
         null)
       : null);
-  // 数据里的另一个方向：方向行点「换方向」切换过去，并记住选择
-  const otherDir =
-    data && dir
-      ? (data.directions.find((d) => d.direction !== dir.direction) ?? null)
-      : null;
   const error = stopped
     ? ""
     : (rtM.data && !rtM.data.ok ? rtM.data.error : "") ||
@@ -4163,7 +5175,7 @@ function CanvasStationCard({
         if (e.key === "Escape") setEditField(null);
       }}
       aria-label={label}
-      className="w-full border border-[var(--accent)] bg-[var(--surface)] px-1.5 py-0.5 text-base text-[var(--text)] [border-radius:6px] outline-none"
+      className="min-h-11 w-full border border-[var(--accent)] bg-[var(--surface)] px-2 py-1.5 text-base text-[var(--text)] [border-radius:6px] outline-none"
     />
   );
   // 点选优先、尽量不打字：点前三行先出可选项（方向=终点站二选一、
@@ -4180,7 +5192,9 @@ function CanvasStationCard({
         line: mod.line,
         direction: mod.direction,
       }),
-    enabled: picker === "station" || picker === "terminal",
+    // 线路一填好就预取终点站选项（点选缓存/高德兜底，不耗 apizero），
+    // 这样方向行的左右三角随时能切，不必先打开点选面板
+    enabled: picker === "station" || picker === "terminal" || mod.line !== "",
   });
   const recentQ = useQuery({
     queryKey: ["linePickRecent", city],
@@ -4200,6 +5214,31 @@ function CanvasStationCard({
   const recentLines = (recentQ.data?.recentLines ?? []).filter(
     (l) => l !== mod.line,
   );
+  // 方向行左右三角：线路填好后点 ◀/▶ 直接在两个终点站之间切换，
+  // 不打开面板、不用打字。另一个终点站与点选面板同源（点选缓存 +
+  // 这张卡已查到的双向实时数据 + 高德兜底），切换立即存服务端；
+  // 已有双向实时数据时第 4/5 行直接按新方向从现有数据换显，不重查。
+  const currentTerminal = mod.terminal || dir?.terminal || "";
+  const otherTerminal =
+    pickTerminals.find((t) => t !== "" && t !== currentTerminal) ?? "";
+  const [triHint, setTriHint] = useState("");
+  useEffect(() => {
+    if (!triHint) return;
+    const id = setTimeout(() => setTriHint(""), 4000);
+    return () => clearTimeout(id);
+  }, [triHint]);
+  const flipDirection = () => {
+    if (otherTerminal) {
+      // 实时数据里有这个方向就带上方向号，没有就按终点站名存（口径不变）
+      const od = data?.directions.find((d) => d.terminal === otherTerminal);
+      onSetDirection(od ? od.direction : 0, otherTerminal);
+      setTriHint("");
+    } else if (pickQ.isLoading || pickQ.isFetching) {
+      setTriHint("正在找这条线的另一个方向，稍等一下再点。");
+    } else {
+      setTriHint("另一方向未知，先点查一次或在方向面板里选。");
+    }
+  };
   // 选项查完确认一个都没有（或查询失败）时，才退回打字输入
   useEffect(() => {
     if (picker !== "terminal" && picker !== "station") return;
@@ -4216,21 +5255,21 @@ function CanvasStationCard({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [picker, pickQ.isSuccess, pickQ.isError, pickQ.data]);
   const pickerFooter = (field: "station" | "line" | "terminal") => (
-    <div className="mt-1.5 flex gap-1.5">
+    <div className="mt-2 flex gap-1.5">
       <button
         type="button"
         onClick={() => {
           setPicker(null);
           startEdit(field, field === "station" ? mod.station : field === "line" ? mod.line : mod.terminal);
         }}
-        className="flex-1 border border-[var(--border)] bg-[var(--surface)] px-2 py-1 text-xs font-medium text-[var(--dim)] [border-radius:6px]"
+        className="min-h-11 flex-1 border border-[var(--border)] bg-[var(--surface)] px-2 py-2 text-sm font-medium text-[var(--dim)] [border-radius:8px]"
       >
         手动输入
       </button>
       <button
         type="button"
         onClick={() => setPicker(null)}
-        className="flex-1 bg-[var(--surface)] px-2 py-1 text-xs font-medium text-[var(--dim)] [border-radius:6px]"
+        className="min-h-11 flex-1 bg-[var(--surface)] px-2 py-2 text-sm font-medium text-[var(--dim)] [border-radius:8px]"
       >
         取消
       </button>
@@ -4254,7 +5293,7 @@ function CanvasStationCard({
               onKeyDown={(e) => {
                 if (e.key === "Enter") setPicker("station");
               }}
-              className={`min-w-0 flex-1 truncate text-base font-bold ${
+              className={`min-w-0 flex-1 truncate py-1 text-lg font-bold ${
                 mod.station
                   ? "text-[var(--text)] underline decoration-[var(--border)] decoration-dotted underline-offset-4"
                   : "text-[var(--dim)]"
@@ -4263,17 +5302,11 @@ function CanvasStationCard({
               {mod.station || "点这里选站名"}
             </span>
           )}
-          <CanvasCardActions
-            label={`${mod.line} ${mod.station}`}
-            onStartLink={onStartLink}
-            onSaveTemplate={onSaveTemplate}
-            saveTemplatePending={saveTemplatePending}
-          />
         </div>
         {picker === "station" && editField !== "station" && (
           <div
             onPointerDown={(e) => e.stopPropagation()}
-            className="mt-1.5 border border-[var(--border)] bg-[var(--surface2)] p-1.5 [border-radius:8px]"
+            className="mt-1.5 w-full max-w-full border border-[var(--border)] bg-[var(--surface2)] p-2 [border-radius:8px]"
           >
             {pickQ.isLoading ? (
               <p className="px-1 py-1 text-sm text-[var(--dim)]">
@@ -4281,7 +5314,7 @@ function CanvasStationCard({
               </p>
             ) : (
               <>
-                <div className="flex max-h-36 flex-wrap gap-1.5 overflow-y-auto">
+                <div className="flex max-h-48 flex-wrap gap-1.5 overflow-y-auto">
                   {pickStops.map((s) => (
                     <button
                       key={s}
@@ -4291,7 +5324,7 @@ function CanvasStationCard({
                         setPicker(null);
                       }}
                       aria-label={`选择站名 ${s}`}
-                      className={`px-2.5 py-1 text-sm font-medium [border-radius:999px] ${
+                      className={`min-h-11 px-3.5 py-2 text-base font-medium [border-radius:999px] ${
                         s === mod.station
                           ? "bg-[var(--accent)] text-[var(--accent-ink)]"
                           : "border border-[var(--border)] bg-[var(--surface)] text-[var(--text)]"
@@ -4337,7 +5370,7 @@ function CanvasStationCard({
         {picker === "line" && editField !== "line" && (
           <div
             onPointerDown={(e) => e.stopPropagation()}
-            className="mt-1.5 border border-[var(--border)] bg-[var(--surface2)] p-1.5 [border-radius:8px]"
+            className="mt-1.5 w-full max-w-full border border-[var(--border)] bg-[var(--surface2)] p-2 [border-radius:8px]"
           >
             {recentQ.isLoading ? (
               <p className="px-1 py-1 text-sm text-[var(--dim)]">
@@ -4356,7 +5389,7 @@ function CanvasStationCard({
                           setPicker(null);
                         }}
                         aria-label={`选择线路 ${l}`}
-                        className="border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1 text-sm font-bold text-[var(--text)] [border-radius:999px]"
+                        className="min-h-11 border border-[var(--border)] bg-[var(--surface)] px-3.5 py-2 text-base font-bold text-[var(--text)] [border-radius:999px]"
                       >
                         {l}
                       </button>
@@ -4373,7 +5406,7 @@ function CanvasStationCard({
           </div>
         )}
       </div>
-      {/* 第 3 行：方向（点一下出终点站大按钮二选一，可留空；有双向数据时可一键换方向） */}
+      {/* 第 3 行：方向（点 ◀ ▶ 直接在两个终点站间切换；点文字出终点站大按钮二选一，可留空） */}
       <div className="mt-1">
         <div className="flex items-center gap-1.5">
           {editField === "terminal" ? (
@@ -4390,7 +5423,7 @@ function CanvasStationCard({
                 }
                 onPointerDown={(e) => e.stopPropagation()}
                 onClick={() => setPicker(picker === "terminal" ? null : "terminal")}
-                className="min-w-0 flex-1 truncate text-sm text-[var(--dim)] underline decoration-[var(--border)] decoration-dotted underline-offset-4"
+                className="min-w-0 flex-1 truncate py-1 text-base text-[var(--dim)] underline decoration-[var(--border)] decoration-dotted underline-offset-4"
               >
                 {mod.terminal
                   ? `开往 ${mod.terminal}`
@@ -4398,23 +5431,38 @@ function CanvasStationCard({
                     ? `开往 ${dir.terminal}`
                     : "方向未填（点我选，可留空）"}
               </span>
-              {otherDir && (
-                <button
-                  type="button"
-                  onClick={() => onSetDirection(otherDir.direction, otherDir.terminal)}
-                  aria-label={`换方向：改看开往 ${otherDir.terminal} 的车`}
-                  className="shrink-0 bg-[var(--surface2)] px-2 py-0.5 text-xs font-medium text-[var(--accent)] [border-radius:999px]"
-                >
-                  ⇄ 换方向
-                </button>
+              {mod.line && (
+                <span className="flex shrink-0 items-center gap-1">
+                  <button
+                    type="button"
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onClick={flipDirection}
+                    aria-label="上一个方向"
+                    className="flex min-h-11 min-w-11 items-center justify-center border border-[var(--border)] bg-[var(--surface2)] px-2 py-2 text-base text-[var(--accent)] [border-radius:8px]"
+                  >
+                    ◀
+                  </button>
+                  <button
+                    type="button"
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onClick={flipDirection}
+                    aria-label="下一个方向"
+                    className="flex min-h-11 min-w-11 items-center justify-center border border-[var(--border)] bg-[var(--surface2)] px-2 py-2 text-base text-[var(--accent)] [border-radius:8px]"
+                  >
+                    ▶
+                  </button>
+                </span>
               )}
             </>
           )}
         </div>
+        {triHint && (
+          <p className="mt-1 text-xs text-[var(--amber)]">{triHint}</p>
+        )}
         {picker === "terminal" && editField !== "terminal" && (
           <div
             onPointerDown={(e) => e.stopPropagation()}
-            className="mt-1.5 border border-[var(--border)] bg-[var(--surface2)] p-1.5 [border-radius:8px]"
+            className="mt-1.5 w-full max-w-full border border-[var(--border)] bg-[var(--surface2)] p-2 [border-radius:8px]"
           >
             {pickQ.isLoading ? (
               <p className="px-1 py-1 text-sm text-[var(--dim)]">
@@ -4439,7 +5487,7 @@ function CanvasStationCard({
                         setPicker(null);
                       }}
                       aria-label={`选择方向：开往 ${t}`}
-                      className={`min-h-[2.5rem] px-2.5 py-1.5 text-left text-base font-bold [border-radius:8px] ${
+                      className={`min-h-12 px-3 py-2.5 text-left text-lg font-bold [border-radius:8px] ${
                         t === mod.terminal
                           ? "bg-[var(--accent)] text-[var(--accent-ink)]"
                           : "border border-[var(--accent)] bg-[var(--surface)] text-[var(--text)]"
@@ -4489,7 +5537,7 @@ function CanvasStationCard({
                         className="flex items-baseline justify-between gap-2"
                       >
                         <span className="flex min-w-0 items-baseline gap-1.5">
-                          <span className="shrink-0 text-xs font-medium text-[var(--dim)]">
+                          <span className="shrink-0 text-sm font-medium text-[var(--dim)]">
                             第 {idx + 1} 班
                           </span>
                           <span
@@ -4519,6 +5567,8 @@ function CanvasStationCard({
         </>
       )}
 
+      {/* 常驻操作行（一行三个，约 40px 高）：开始/停止、点查、更多。
+          调序/改步/存库/删除/备注都在「更多」展开区里，卡面不再摊开 */}
       <div className="mt-2 flex items-center gap-1.5">
         <button
           type="button"
@@ -4529,7 +5579,7 @@ function CanvasStationCard({
               : `停止 ${mod.line} 在 ${mod.station} 的模块`
           }
           aria-pressed={!stopped}
-          className={`shrink-0 px-3 py-1 text-sm font-bold [border-radius:8px] ${
+          className={`min-h-10 flex-1 px-2.5 text-base font-bold whitespace-nowrap [border-radius:8px] ${
             stopped
               ? "bg-[var(--accent)] text-[var(--accent-ink)]"
               : "border border-[var(--border)] bg-[var(--surface)] text-[var(--dim)]"
@@ -4542,25 +5592,54 @@ function CanvasStationCard({
           onClick={() => rtM.mutate()}
           disabled={stopped || rtM.isPending || !mod.line || !mod.station}
           aria-label={`刷新 ${mod.line} 在 ${mod.station} 的实时到站`}
-          className="shrink-0 bg-[var(--accent)] px-3 py-1 text-sm font-bold text-[var(--accent-ink)] [border-radius:8px] disabled:opacity-40"
+          className="min-h-10 flex-1 bg-[var(--accent)] px-2.5 text-base font-bold whitespace-nowrap text-[var(--accent-ink)] [border-radius:8px] disabled:opacity-40"
         >
           {rtM.isPending ? "查询中…" : data ? "↻ 刷新" : "↻ 点查"}
         </button>
+        <button
+          type="button"
+          onClick={onToggleMore}
+          aria-expanded={moreOpen}
+          aria-label={
+            moreOpen
+              ? `收起 ${mod.line} 在 ${mod.station} 的更多操作`
+              : `展开 ${mod.line} 在 ${mod.station} 的更多操作（调序、改步、存库、删除、备注）`
+          }
+          className={`min-h-10 shrink-0 px-3 text-base font-bold whitespace-nowrap [border-radius:8px] ${
+            moreOpen
+              ? "bg-[var(--accent)] text-[var(--accent-ink)]"
+              : "bg-[var(--surface2)] text-[var(--text)]"
+          }`}
+        >
+          更多 ⋯
+        </button>
       </div>
-      <input
-        defaultValue={mod.note}
-        key={`${mod.id}:${mod.note}`}
-        onBlur={(e) => {
-          const v = e.target.value.trim();
-          if (v !== mod.note) onSaveNote(v);
-        }}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") (e.target as HTMLInputElement).blur();
-        }}
-        placeholder="备注，如：下车过马路"
-        aria-label={`${mod.line} ${mod.station} 的备注`}
-        className="mt-1.5 w-full border-b border-dashed border-[var(--border)] bg-transparent px-1 py-0.5 text-xs text-[var(--dim)] outline-none placeholder:text-[var(--dim)] focus:border-[var(--accent)]"
-      />
+      {moreOpen && (
+        <div className="mt-2 border-t border-[var(--border)] pt-2">
+          <CanvasCardMoreTools
+            label={`${mod.line} ${mod.station}`}
+            onStartLink={onStartLink}
+            onSaveTemplate={onSaveTemplate}
+            saveTemplatePending={saveTemplatePending}
+            onDeleteRequest={onDeleteRequest}
+          />
+          {flowTools}
+          <input
+            defaultValue={mod.note}
+            key={`${mod.id}:${mod.note}`}
+            onBlur={(e) => {
+              const v = e.target.value.trim();
+              if (v !== mod.note) onSaveNote(v);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+            }}
+            placeholder="备注，如：下车过马路"
+            aria-label={`${mod.line} ${mod.station} 的备注`}
+            className="mt-1 min-h-10 w-full border-b border-dashed border-[var(--border)] bg-transparent px-1 py-1.5 text-sm text-[var(--dim)] outline-none placeholder:text-[var(--dim)] focus:border-[var(--accent)]"
+          />
+        </div>
+      )}
     </div>
   );
 }
@@ -4571,35 +5650,69 @@ function CanvasTextCard({
   onSaveTemplate,
   saveTemplatePending,
   onSaveText,
+  moreOpen,
+  onToggleMore,
+  onDeleteRequest,
+  flowTools,
 }: {
   mod: CanvasModule;
-  onStartLink: () => void;
+  onStartLink?: () => void;
   onSaveTemplate: () => void;
   saveTemplatePending: boolean;
   onSaveText: (text: string) => void;
+  // 「更多」展开区：与到站卡同一套结构（存库/连线/删除 + 流模式调序改步）
+  moreOpen: boolean;
+  onToggleMore: () => void;
+  onDeleteRequest: () => void;
+  flowTools?: ReactNode;
 }) {
   return (
     <div>
-      <div className="flex items-start gap-1.5">
-        <textarea
-          defaultValue={mod.text}
-          key={`${mod.id}:${mod.text}`}
-          rows={2}
-          onBlur={(e) => {
-            const v = e.target.value.trim();
-            if (v && v !== mod.text) onSaveText(v);
-          }}
-          aria-label="文本卡内容（改完点别处保存）"
-          className="min-w-0 flex-1 resize-none bg-transparent text-lg font-bold text-[var(--text)] outline-none"
-        />
-        <CanvasCardActions
-          label={`文本卡 ${mod.text}`}
-          onStartLink={onStartLink}
-          onSaveTemplate={onSaveTemplate}
-          saveTemplatePending={saveTemplatePending}
-        />
+      <textarea
+        defaultValue={mod.text}
+        key={`${mod.id}:${mod.text}`}
+        rows={2}
+        onBlur={(e) => {
+          const v = e.target.value.trim();
+          if (v && v !== mod.text) onSaveText(v);
+        }}
+        aria-label="文本卡内容（改完点别处保存）"
+        className="w-full resize-none bg-transparent text-lg font-bold text-[var(--text)] outline-none"
+      />
+      <div className="mt-1 flex items-center gap-1.5">
+        <span className="min-w-0 flex-1 truncate text-xs text-[var(--dim)]">
+          文本卡 · 改完点别处自动保存
+        </span>
+        <button
+          type="button"
+          onClick={onToggleMore}
+          aria-expanded={moreOpen}
+          aria-label={
+            moreOpen
+              ? `收起文本卡 ${mod.text} 的更多操作`
+              : `展开文本卡 ${mod.text} 的更多操作（调序、改步、存库、删除）`
+          }
+          className={`min-h-10 shrink-0 px-3 text-base font-bold whitespace-nowrap [border-radius:8px] ${
+            moreOpen
+              ? "bg-[var(--accent)] text-[var(--accent-ink)]"
+              : "bg-[var(--surface2)] text-[var(--text)]"
+          }`}
+        >
+          更多 ⋯
+        </button>
       </div>
-      <p className="text-xs text-[var(--dim)]">文本卡 · 改完点别处自动保存</p>
+      {moreOpen && (
+        <div className="mt-2 border-t border-[var(--border)] pt-2">
+          <CanvasCardMoreTools
+            label={`文本卡 ${mod.text}`}
+            onStartLink={onStartLink}
+            onSaveTemplate={onSaveTemplate}
+            saveTemplatePending={saveTemplatePending}
+            onDeleteRequest={onDeleteRequest}
+          />
+          {flowTools}
+        </div>
+      )}
     </div>
   );
 }

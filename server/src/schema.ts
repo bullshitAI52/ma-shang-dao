@@ -77,14 +77,34 @@ export const transferWalkTimes = sqliteTable("transfer_walk_times", {
     .$defaultFn(() => new Date()),
 });
 
+// 画布项目：用户把一张画布（模块+连线+布局）打包命名的整体，如
+// 「上班」。按城市隔离，每城最多 20 个（服务端校验）。模块与连线
+// 通过 project_id 归属到项目；项目里改完即自动存（模块/连线本身
+// 就是持久化行），切换项目即整张恢复。迁移前的旧模块/连线
+// project_id=0，服务端首次读画布时把它们迁入自动建的默认项目。
+export const canvasProjects = sqliteTable("canvas_projects", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  city: text("city").notNull().default("厦门"),
+  name: text("name").notNull().default("默认项目"),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
 // 画布模块：到站卡片（station：线路+站点+方向，direction 是接口方向号
 // 1/2、terminal 是该方向终点站）与文本卡片（text：纯文字，如目的地）。
 // x/y 是画布世界坐标（浮点），按城市隔离。note 是卡片底部的小字备注。
 // enabled 是到站卡的开始/停止开关：1=开始（可查实时），0=停止（变灰
 // 待机、不发起任何查询）；新模块默认开始。文本卡不用这个字段。
+// stepIndex 是步骤分组键：同值的多个模块同属一步、是「备选方案」
+// （或，任选其一），步与步之间是先后（然后）。0 = 尚未编号，服务端
+// 在 listCanvas 里按纵向流顺序一次性编号（一卡一步）后回写，之后
+// 恒 ≥1；编号只作分组键、允许空缺，「第 X 步」由前端按分组顺序算。
 export const canvasModules = sqliteTable("canvas_modules", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   city: text("city").notNull().default("厦门"),
+  projectId: integer("project_id").notNull().default(0),
+  stepIndex: integer("step_index").notNull().default(0),
   kind: text("kind", { enum: ["station", "text"] }).notNull(),
   line: text("line").notNull().default(""),
   station: text("station").notNull().default(""),
@@ -105,6 +125,7 @@ export const canvasModules = sqliteTable("canvas_modules", {
 export const canvasLinks = sqliteTable("canvas_links", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   city: text("city").notNull().default("厦门"),
+  projectId: integer("project_id").notNull().default(0),
   fromId: integer("from_id").notNull(),
   toId: integer("to_id").notNull(),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
