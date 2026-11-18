@@ -50,6 +50,20 @@
       "when": 1794962887158,
       "tag": "0007_transfer_walk_times_table",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1794967451379,
+      "tag": "0008_canvas_modules_and_links_tables",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1794968148557,
+      "tag": "0009_canvas_module_enabled_flag",
+      "breakpoints": true
     }
   ]
 }

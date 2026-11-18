@@ -63,10 +63,10 @@
   }
 }
 
-/* Phone tap targets: at least 32px tall. */
+/* Phone tap targets: at least 36px tall. */
 @layer base {
   button, [role="button"], select, summary, input:not([type="checkbox"], [type="radio"]) {
-    min-height: 2rem;
+    min-height: 2.25rem;
   }
   body {
     font-family: var(--font-sans);

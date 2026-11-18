@@ -12,7 +12,7 @@ z,
 type ActionsModule,
 type Ctx,
 } from "@hatch/space-sdk";
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, or } from "drizzle-orm";
 import { privileged } from "@space/privileged";
 import * as schema from "./schema";
 
@@ -127,17 +127,46 @@ function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
+// 北京时间（Asia/Shanghai）「H:MM」：小时不补零，如「7:20」。服务端
+// 运行环境时区不一定是北京，凡是时刻显示一律显式按 Asia/Shanghai 换算，
+// 不用运行环境的本地时区。
+const bjTimeFmt = new Intl.DateTimeFormat("zh-CN", {
+  timeZone: "Asia/Shanghai",
+  hour: "2-digit",
+  minute: "2-digit",
+  hourCycle: "h23",
+});
+function beijingHm(d: Date): string {
+  const parts = bjTimeFmt.formatToParts(d);
+  const h = parts.find((p) => p.type === "hour")?.value ?? "0";
+  const min = parts.find((p) => p.type === "minute")?.value ?? "00";
+  return `${Number(h) % 24}:${min.padStart(2, "0")}`;
+}
+
+// 接口的 arrival_time 归一成北京时间「H:MM」：
+// - 带时区的 ISO 时刻 → 显式按 Asia/Shanghai 换算
+// - 「2026-08-30 07:20」这类无时区字符串是接口给的北京时间墙钟时间，
+//   直接取时刻部分并去掉小时的前导零（07:20 → 7:20）
+// - 纯「07:20」同上
+function beijingArrivalHm(raw: string): string {
+  const s = raw.trim();
+  if (!s) return "";
+  if (/T.*(Z|[+-]\d{2}:?\d{2})\s*$/.test(s)) {
+    const d = new Date(s);
+    if (!Number.isNaN(d.getTime())) return beijingHm(d);
+  }
+  const m = s.match(/(\d{1,2}):(\d{2})/);
+  if (m) return `${Number(m[1])}:${m[2]}`;
+  return s;
+}
+
 function toBus(raw: unknown): Bus {
   const b = rec(raw);
-  const arrival = str(b.arrival_time);
   return {
     busId: str(b.bus_id),
     stopsRemaining: numOrNull(b.stops_remaining),
     travelMinutes: numOrNull(b.travel_minutes),
-    // "2026-08-30 22:23" → "22:23"
-    arrivalTime: arrival.includes(" ")
-      ? (arrival.split(" ")[1] ?? "").slice(0, 5)
-      : arrival,
+    arrivalTime: beijingArrivalHm(str(b.arrival_time)),
   };
 }
 
@@ -707,6 +736,10 @@ const routePlanResponse = z.object({
           departure: z.string(),
           arrival: z.string(),
           walkDistance: z.string(),
+          // 该段行进方向的终点站：从高德线路名括号里「(起点--终点)」
+          // 解析，取行进方向那一头；解析不到为空串。转画布时用它定
+          // 方向，不用再额外调实时接口。
+          terminal: z.string(),
         }),
       ),
     }),
@@ -755,6 +788,188 @@ const transferWalkTimesResponse = z.object({
     }),
   ),
 });
+
+// ---------- 画布（到站模块 + 文本模块 + 连线，按城市隔离） ----------
+// 模块位置（x/y 世界坐标）、字段与连线都存服务端；连线只表达路线
+// 关系，不触发任何查询。厦门画布首次打开（为空且从未初始化）时按
+// 用户手绘草图一次性预置种子，方向一律用线路站序实查判定，判定不
+// 了的模块宁缺勿错、先不预置；种子标记存 settings，删空不补回。
+
+const canvasResponse = z.object({
+  modules: z.array(
+    z.object({
+      id: z.number(),
+      kind: z.string(),
+      line: z.string(),
+      station: z.string(),
+      direction: z.number(),
+      terminal: z.string(),
+      text: z.string(),
+      note: z.string(),
+      enabled: z.boolean(),
+      x: z.number(),
+      y: z.number(),
+    }),
+  ),
+  links: z.array(
+    z.object({ id: z.number(), fromId: z.number(), toId: z.number() }),
+  ),
+});
+
+async function listCanvas(
+  ctx: Ctx,
+  city: string,
+): Promise<z.infer<typeof canvasResponse>> {
+  const db = ctx.db<typeof schema>();
+  const mods = await db
+    .select()
+    .from(schema.canvasModules)
+    .where(eq(schema.canvasModules.city, city))
+    .orderBy(schema.canvasModules.id)
+    .limit(200);
+  const lnks = await db
+    .select()
+    .from(schema.canvasLinks)
+    .where(eq(schema.canvasLinks.city, city))
+    .orderBy(schema.canvasLinks.id)
+    .limit(400);
+  return {
+    modules: mods.map((m) => ({
+      id: m.id,
+      kind: m.kind,
+      line: m.line,
+      station: m.station,
+      direction: m.direction,
+      terminal: m.terminal,
+      text: m.text,
+      note: m.note,
+      enabled: m.enabled !== 0,
+      x: m.x,
+      y: m.y,
+    })),
+    links: lnks.map((l) => ({ id: l.id, fromId: l.fromId, toId: l.toId })),
+  };
+}
+
+const CANVAS_SEED_KEY_PREFIX = "canvas_seeded:";
+
+/**
+ * 按站序判定方向：某方向的站点序里，上车站在前、其后有站名含 marker
+ * 的站，这个方向就是要的方向；终点站取该方向站点序的最后一站。
+ * 两个方向都判定不了返回 null（调用方宁缺勿错，不预置该模块）。
+ */
+async function seedDirection(
+  ctx: Ctx,
+  city: string,
+  line: string,
+  station: string,
+  marker: string,
+): Promise<{ direction: number; terminal: string } | null> {
+  for (const direction of [1, 2]) {
+    const stops = await getLineStops(ctx, city, line, direction, true);
+    if (!stops || stops.length === 0) continue;
+    const si = stops.indexOf(station);
+    if (si < 0) continue;
+    if (!stops.slice(si + 1).some((s) => s.includes(marker))) continue;
+    return { direction, terminal: stops[stops.length - 1] ?? "" };
+  }
+  return null;
+}
+
+/** 厦门画布种子：草图里的 4 个到站模块 + 马厝/同安中心文本模块 + 连线。 */
+async function maybeSeedCanvas(ctx: Ctx, city: string): Promise<void> {
+  if (city !== DEFAULT_CITY) return;
+  try {
+    const db = ctx.db<typeof schema>();
+    const existing = await db
+      .select({ id: schema.canvasModules.id })
+      .from(schema.canvasModules)
+      .where(eq(schema.canvasModules.city, city))
+      .limit(1);
+    if (existing.length > 0) return;
+    if (await getSetting(ctx, `${CANVAS_SEED_KEY_PREFIX}${city}`)) return;
+
+    const specs = [
+      { line: "33路", station: "长虹路", marker: "西浦路口", x: 330, y: 30 },
+      { line: "24路", station: "西浦路口", marker: "马厝", x: 570, y: 250 },
+      { line: "103路", station: "西浦路口", marker: "同安", x: 300, y: 250 },
+      { line: "752路", station: "西浦路口", marker: "同安", x: 30, y: 250 },
+    ];
+    const insertModule = async (
+      values: typeof schema.canvasModules.$inferInsert,
+    ): Promise<number | null> => {
+      const rows = await db
+        .insert(schema.canvasModules)
+        .values(values)
+        .returning({ id: schema.canvasModules.id });
+      return rows[0]?.id ?? null;
+    };
+    const ids: (number | null)[] = [];
+    for (const s of specs) {
+      const dir = await seedDirection(ctx, city, s.line, s.station, s.marker);
+      if (!dir) {
+        ids.push(null);
+        continue;
+      }
+      ids.push(
+        await insertModule({
+          city,
+          kind: "station",
+          line: s.line,
+          station: s.station,
+          direction: dir.direction,
+          terminal: dir.terminal,
+          x: s.x,
+          y: s.y,
+        }),
+      );
+    }
+    if (!ids.some((v) => v != null)) {
+      // 一个方向都没判定出来（多半是接口暂不可用）：不落种子标记，
+      // 下次打开画布再试，不把空画布当成已初始化。
+      return;
+    }
+    let maCuoId: number | null = null;
+    if (ids[1]) {
+      maCuoId = await insertModule({
+        city,
+        kind: "text",
+        text: "马厝",
+        x: 570,
+        y: 490,
+      });
+    }
+    let tongAnId: number | null = null;
+    if (ids[2] || ids[3]) {
+      tongAnId = await insertModule({
+        city,
+        kind: "text",
+        text: "同安中心",
+        x: 165,
+        y: 490,
+      });
+    }
+    const idAt = (i: number): number | null => ids[i] ?? null;
+    const linkPairs: [number | null, number | null][] = [
+      [idAt(0), idAt(1)],
+      [idAt(0), idAt(2)],
+      [idAt(0), idAt(3)],
+      [idAt(1), maCuoId],
+      [idAt(2), tongAnId],
+      [idAt(3), tongAnId],
+    ];
+    for (const [a, b] of linkPairs) {
+      if (a && b) {
+        await db
+          .insert(schema.canvasLinks)
+          .values({ city, fromId: a, toId: b });
+      }
+    }
+    await setSetting(ctx, `${CANVAS_SEED_KEY_PREFIX}${city}`, "1");
+  } catch {
+    // 种子失败不挡画布打开：用户仍可自己一个个加模块
+  }
+}
 
 async function listTransferWalkTimes(
   ctx: Ctx,
@@ -1004,13 +1219,8 @@ async function listFavorites(
   };
 }
 
-const nowHm = () =>
-  new Date().toLocaleTimeString("zh-CN", {
-    timeZone: "Asia/Shanghai",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  });
+// 数据时间与到站时刻同一口径：北京时间、小时不补零（「7:20」）
+const nowHm = () => beijingHm(new Date());
 
 // ---------- actions ----------
 
@@ -1375,6 +1585,13 @@ export const Actions = {
               const bl = rec(buslines[0]);
               if (buslines.length > 0) {
                 const name = str(bl.name);
+                // 高德线路名形如「33路(公园东门--高崎公交场站)」，
+                // 括号里是该方向的起讫站，后一头就是行进方向终点站
+                const paren = name.match(/[（(]([^（）()]*)[）)]/);
+                const ends = (paren?.[1] ?? "")
+                  .split("--")
+                  .map((s) => s.trim())
+                  .filter((s) => s !== "");
                 segments.push({
                   type: str(bl.type) || "公交",
                   name: name.includes("(")
@@ -1383,6 +1600,8 @@ export const Actions = {
                   departure: str(rec(bl.departure_stop).name),
                   arrival: str(rec(bl.arrival_stop).name),
                   walkDistance: "",
+                  terminal:
+                    ends.length >= 2 ? (ends[ends.length - 1] ?? "") : "",
                 });
               }
             } else if ("walking" in seg) {
@@ -1392,6 +1611,7 @@ export const Actions = {
                 departure: "",
                 arrival: "",
                 walkDistance: str(rec(seg.walking).distance),
+                terminal: "",
               });
             }
           }
@@ -1755,6 +1975,344 @@ export const Actions = {
         });
       }
       return listTransferWalkTimes(ctx, city);
+    },
+  }),
+
+  getCanvas: defineAction({
+    description:
+      "读取某城市画布的全部模块（到站卡/文本卡，含位置与备注）与连线。厦门画布为空且从未初始化时，先按用户通勤草图一次性预置种子（方向按线路站序实查判定，判定不了的模块不预置；用户删空后不再自动补）。city 缺省为厦门。",
+    request: z.object({ city: z.string().max(20).optional() }),
+    response: canvasResponse,
+    privileged: [privileged.apizeroCall],
+    async handler(ctx, args): Promise<z.infer<typeof canvasResponse>> {
+      const city = cityOf(args.city);
+      await maybeSeedCanvas(ctx, city);
+      return listCanvas(ctx, city);
+    },
+  }),
+
+  addCanvasModule: defineAction({
+    description:
+      "往某城市画布加一个模块：kind=station 时给 line/station/direction（接口方向号 1/2）/terminal（该方向终点站），kind=text 时给 text（纯文字内容）；x/y 是画布世界坐标。返回该城市画布全量。city 缺省为厦门。",
+    request: z.object({
+      kind: z.enum(["station", "text"]),
+      line: z.string().max(20).optional(),
+      station: z.string().max(40).optional(),
+      direction: z.number().int().min(0).max(2).optional(),
+      terminal: z.string().max(40).optional(),
+      text: z.string().max(200).optional(),
+      note: z.string().max(100).optional(),
+      x: z.number().min(-10000).max(10000),
+      y: z.number().min(-10000).max(10000),
+      city: z.string().max(20).optional(),
+    }),
+    response: canvasResponse,
+    async handler(ctx, args): Promise<z.infer<typeof canvasResponse>> {
+      const city = cityOf(args.city);
+      const db = ctx.db<typeof schema>();
+      await db.insert(schema.canvasModules).values({
+        city,
+        kind: args.kind,
+        line: args.kind === "station" ? normalizeLine(args.line ?? "") : "",
+        station: args.kind === "station" ? (args.station ?? "").trim() : "",
+        direction: args.kind === "station" ? (args.direction ?? 0) : 0,
+        terminal: args.kind === "station" ? (args.terminal ?? "").trim() : "",
+        text: args.kind === "text" ? (args.text ?? "").trim() : "",
+        note: (args.note ?? "").trim(),
+        x: args.x,
+        y: args.y,
+      });
+      return listCanvas(ctx, city);
+    },
+  }),
+
+  updateCanvasModule: defineAction({
+    description:
+      "更新画布模块：传 x/y 改位置（拖动结束时保存），传 note 改备注，传 text 改文本模块的文字，传 enabled 开/停到站模块（停止后不查实时），传 direction/terminal 补选方向（从规划转入时方向定不了的模块用）；没传的字段不动。返回该城市画布全量。city 缺省为厦门。",
+    request: z.object({
+      id: z.number().int().positive(),
+      x: z.number().min(-10000).max(10000).optional(),
+      y: z.number().min(-10000).max(10000).optional(),
+      note: z.string().max(100).optional(),
+      text: z.string().max(200).optional(),
+      enabled: z.boolean().optional(),
+      direction: z.number().int().min(0).max(2).optional(),
+      terminal: z.string().max(40).optional(),
+      city: z.string().max(20).optional(),
+    }),
+    response: canvasResponse,
+    async handler(ctx, args): Promise<z.infer<typeof canvasResponse>> {
+      const city = cityOf(args.city);
+      const db = ctx.db<typeof schema>();
+      const set: Partial<typeof schema.canvasModules.$inferInsert> = {};
+      if (args.x !== undefined) set.x = args.x;
+      if (args.y !== undefined) set.y = args.y;
+      if (args.note !== undefined) set.note = args.note.trim();
+      if (args.text !== undefined) set.text = args.text.trim();
+      if (args.enabled !== undefined) set.enabled = args.enabled ? 1 : 0;
+      if (args.direction !== undefined) set.direction = args.direction;
+      if (args.terminal !== undefined) set.terminal = args.terminal.trim();
+      if (Object.keys(set).length > 0) {
+        await db
+          .update(schema.canvasModules)
+          .set(set)
+          .where(eq(schema.canvasModules.id, args.id));
+      }
+      return listCanvas(ctx, city);
+    },
+  }),
+
+  removeCanvasModule: defineAction({
+    description:
+      "删除一个画布模块，并一并删掉与它相连的全部连线。返回该城市画布全量。city 缺省为厦门。",
+    request: z.object({
+      id: z.number().int().positive(),
+      city: z.string().max(20).optional(),
+    }),
+    response: canvasResponse,
+    async handler(ctx, args): Promise<z.infer<typeof canvasResponse>> {
+      const city = cityOf(args.city);
+      const db = ctx.db<typeof schema>();
+      await db
+        .delete(schema.canvasLinks)
+        .where(
+          or(
+            eq(schema.canvasLinks.fromId, args.id),
+            eq(schema.canvasLinks.toId, args.id),
+          ),
+        );
+      await db
+        .delete(schema.canvasModules)
+        .where(eq(schema.canvasModules.id, args.id));
+      return listCanvas(ctx, city);
+    },
+  }),
+
+  addCanvasLink: defineAction({
+    description:
+      "在画布两个模块之间加一条连线（fromId → toId，只表达路线关系，不触发任何查询）；自己连自己、重复连线（正反向都算）会被忽略。返回该城市画布全量。city 缺省为厦门。",
+    request: z.object({
+      fromId: z.number().int().positive(),
+      toId: z.number().int().positive(),
+      city: z.string().max(20).optional(),
+    }),
+    response: canvasResponse,
+    async handler(ctx, args): Promise<z.infer<typeof canvasResponse>> {
+      const city = cityOf(args.city);
+      const db = ctx.db<typeof schema>();
+      if (args.fromId !== args.toId) {
+        const mods = await db
+          .select({ id: schema.canvasModules.id })
+          .from(schema.canvasModules)
+          .where(
+            and(
+              eq(schema.canvasModules.city, city),
+              or(
+                eq(schema.canvasModules.id, args.fromId),
+                eq(schema.canvasModules.id, args.toId),
+              ),
+            ),
+          );
+        if (mods.length === 2) {
+          const dup = await db
+            .select({ id: schema.canvasLinks.id })
+            .from(schema.canvasLinks)
+            .where(
+              and(
+                eq(schema.canvasLinks.city, city),
+                or(
+                  and(
+                    eq(schema.canvasLinks.fromId, args.fromId),
+                    eq(schema.canvasLinks.toId, args.toId),
+                  ),
+                  and(
+                    eq(schema.canvasLinks.fromId, args.toId),
+                    eq(schema.canvasLinks.toId, args.fromId),
+                  ),
+                ),
+              ),
+            )
+            .limit(1);
+          if (dup.length === 0) {
+            await db.insert(schema.canvasLinks).values({
+              city,
+              fromId: args.fromId,
+              toId: args.toId,
+            });
+          }
+        }
+      }
+      return listCanvas(ctx, city);
+    },
+  }),
+
+  removeCanvasLink: defineAction({
+    description: "删除画布上的一条连线。返回该城市画布全量。city 缺省为厦门。",
+    request: z.object({
+      id: z.number().int().positive(),
+      city: z.string().max(20).optional(),
+    }),
+    response: canvasResponse,
+    async handler(ctx, args): Promise<z.infer<typeof canvasResponse>> {
+      const city = cityOf(args.city);
+      const db = ctx.db<typeof schema>();
+      await db
+        .delete(schema.canvasLinks)
+        .where(eq(schema.canvasLinks.id, args.id));
+      return listCanvas(ctx, city);
+    },
+  }),
+
+  importPlanToCanvas: defineAction({
+    description:
+      "把一套规划方案（或进行中行程的各段）一键转成画布上的一条模块链：每个乘车段生成一个到站模块（上车站+线路+方向），步行段生成文本模块（步行约 X 分钟），最后加一个目的地文本模块，模块从左到右排开、依次连线。方向优先用方案自带的终点站与服务端站点序缓存（只读、不调实时接口）推导；推导不出方向号时用终点站匹配，终点站也没有就建 direction=0 的模块、由用户在画布上点选方向。画布已有内容时新链排在现有内容下方，不覆盖不清屏。返回该城市画布全量。city 缺省为厦门。",
+    request: z.object({
+      origin: z.string().min(1).max(60),
+      destination: z.string().min(1).max(60),
+      segments: z
+        .array(
+          z.object({
+            type: z.string().max(20),
+            name: z.string().max(60),
+            departure: z.string().max(60),
+            arrival: z.string().max(60),
+            walkDistance: z.string().max(20),
+            terminal: z.string().max(60).optional(),
+          }),
+        )
+        .min(1)
+        .max(20),
+      city: z.string().max(20).optional(),
+    }),
+    response: canvasResponse,
+    async handler(ctx, args): Promise<z.infer<typeof canvasResponse>> {
+      const city = cityOf(args.city);
+      const db = ctx.db<typeof schema>();
+
+      // 新链排在现有内容下方：取现有模块的最大 y 再下移一行多
+      const existing = await db
+        .select({ y: schema.canvasModules.y })
+        .from(schema.canvasModules)
+        .where(eq(schema.canvasModules.city, city))
+        .limit(400);
+      const baseY =
+        existing.length > 0
+          ? Math.max(...existing.map((r) => r.y)) + 300
+          : 40;
+      const baseX = 40;
+      const stepX = 292;
+      const perRow = 7;
+      const rowH = 300;
+
+      type ModSpec = {
+        kind: "station" | "text";
+        line?: string;
+        station?: string;
+        direction?: number;
+        terminal?: string;
+        text?: string;
+      };
+      const specs: ModSpec[] = [];
+      const segs = args.segments;
+      for (let i = 0; i < segs.length; i++) {
+        const s = segs[i];
+        if (!s) continue;
+        if (s.type === "步行") {
+          const dist = Number(s.walkDistance) || 0;
+          const between =
+            segs.slice(0, i).some((x) => x.type !== "步行") &&
+            segs.slice(i + 1).some((x) => x.type !== "步行");
+          // 与规划页同一口径：没距离又不是换乘步行的占位段不生成模块
+          if (dist <= 0 && !between) continue;
+          const mins =
+            dist > 0 ? Math.min(30, Math.max(1, Math.round(dist / 80))) : 0;
+          specs.push({
+            kind: "text",
+            text:
+              dist > 0
+                ? `步行约 ${mins} 分钟`
+                : "步行换乘",
+          });
+          continue;
+        }
+        // 乘车段：方向先用方案自带终点站，再用站点序缓存（只读）核对
+        // 出方向号；缓存没有就只存终点站（卡片查询时按终点站匹配方
+        // 向）；终点站也没有就 direction=0，等用户在画布上点选。
+        const line = s.name.trim();
+        const station = s.departure.trim();
+        let terminal = (s.terminal ?? "").trim();
+        let direction = 0;
+        if (line && station) {
+          for (const dir of [1, 2]) {
+            const stops = await getLineStops(ctx, city, line, dir, false);
+            if (!stops || stops.length === 0) continue;
+            const si = stops.indexOf(station);
+            if (si < 0) continue;
+            const last = stops[stops.length - 1] ?? "";
+            if (terminal && last === terminal) {
+              direction = dir;
+              break;
+            }
+            if (!terminal && si < stops.length - 1) {
+              // 没有终点站信息时：上车站不在该方向末站、且下车站在它
+              // 后面，才认定是这个方向
+              const ai = stops.indexOf(s.arrival.trim());
+              if (ai > si) {
+                direction = dir;
+                terminal = last;
+                break;
+              }
+            }
+          }
+          if (direction === 0 && terminal) {
+            // 方向号没核对出来不要紧：卡片按终点站也能匹配方向；
+            // 但终点站若与缓存里某方向的末站对不上（缓存旧/异名），
+            // 保持原样让用户点选修正，不硬改。
+          }
+        }
+        specs.push({
+          kind: "station",
+          line,
+          station,
+          direction,
+          terminal,
+        });
+      }
+      specs.push({ kind: "text", text: args.destination.trim() });
+
+      const ids: number[] = [];
+      for (let i = 0; i < specs.length; i++) {
+        const spec = specs[i];
+        if (!spec) continue;
+        const x = baseX + (i % perRow) * stepX;
+        const y = baseY + Math.floor(i / perRow) * rowH;
+        const rows = await db
+          .insert(schema.canvasModules)
+          .values({
+            city,
+            kind: spec.kind,
+            line: spec.kind === "station" ? (spec.line ?? "") : "",
+            station: spec.kind === "station" ? (spec.station ?? "") : "",
+            direction: spec.kind === "station" ? (spec.direction ?? 0) : 0,
+            terminal: spec.kind === "station" ? (spec.terminal ?? "") : "",
+            text: spec.kind === "text" ? (spec.text ?? "") : "",
+            x,
+            y,
+          })
+          .returning({ id: schema.canvasModules.id });
+        const id = rows[0]?.id;
+        if (id) ids.push(id);
+      }
+      for (let i = 0; i + 1 < ids.length; i++) {
+        const a = ids[i];
+        const b = ids[i + 1];
+        if (a && b) {
+          await db
+            .insert(schema.canvasLinks)
+            .values({ city, fromId: a, toId: b });
+        }
+      }
+      return listCanvas(ctx, city);
     },
   }),
 

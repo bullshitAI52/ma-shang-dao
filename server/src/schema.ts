@@ -2,7 +2,7 @@
 // All transit data itself is fetched live from the upstream APIs and is
 // never persisted.
 
-import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { integer, real, sqliteTable, text } from "drizzle-orm/sqlite-core";
 
 export const favorites = sqliteTable("favorites", {
   id: integer("id").primaryKey({ autoIncrement: true }),
@@ -67,6 +67,41 @@ export const transferWalkTimes = sqliteTable("transfer_walk_times", {
     .notNull()
     .$defaultFn(() => new Date()),
   updatedAt: integer("updated_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+// 画布模块：到站卡片（station：线路+站点+方向，direction 是接口方向号
+// 1/2、terminal 是该方向终点站）与文本卡片（text：纯文字，如目的地）。
+// x/y 是画布世界坐标（浮点），按城市隔离。note 是卡片底部的小字备注。
+// enabled 是到站卡的开始/停止开关：1=开始（可查实时），0=停止（变灰
+// 待机、不发起任何查询）；新模块默认开始。文本卡不用这个字段。
+export const canvasModules = sqliteTable("canvas_modules", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  city: text("city").notNull().default("厦门"),
+  kind: text("kind", { enum: ["station", "text"] }).notNull(),
+  line: text("line").notNull().default(""),
+  station: text("station").notNull().default(""),
+  direction: integer("direction").notNull().default(0),
+  terminal: text("terminal").notNull().default(""),
+  text: text("text").notNull().default(""),
+  note: text("note").notNull().default(""),
+  enabled: integer("enabled").notNull().default(1),
+  x: real("x").notNull().default(0),
+  y: real("y").notNull().default(0),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+// 画布连线：from 模块 → to 模块，只表达路线关系，不触发任何查询。
+// 删模块时服务端一并删掉与它相连的线。
+export const canvasLinks = sqliteTable("canvas_links", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  city: text("city").notNull().default("厦门"),
+  fromId: integer("from_id").notNull(),
+  toId: integer("to_id").notNull(),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),
 });
