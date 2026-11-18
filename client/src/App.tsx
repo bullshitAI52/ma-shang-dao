@@ -3038,8 +3038,11 @@ function CanvasView({
   });
   const modules = canvasQ.data?.modules ?? [];
   const links = canvasQ.data?.links ?? [];
-  // 停止状态的到站模块不进快照、不发起任何查询
-  const stationMods = modules.filter((m) => m.kind === "station" && m.enabled);
+  // 停止状态的到站模块不进快照、不发起任何查询；空白卡（线路/站名
+  // 还没填）也没有可查的键，一样不进快照
+  const stationMods = modules.filter(
+    (m) => m.kind === "station" && m.enabled && m.line.trim() && m.station.trim(),
+  );
 
   // 打开画布先读缓存快照：有缓存的到站卡直接显示，没缓存的点刷新才查
   const snapshot = useQuery({
@@ -3083,6 +3086,8 @@ function CanvasView({
       enabled?: boolean;
       direction?: number;
       terminal?: string;
+      line?: string;
+      station?: string;
     }) => api.updateCanvasModule({ ...args, city }),
     onSuccess: applyCanvas,
   });
@@ -3334,6 +3339,20 @@ function CanvasView({
     addModuleMut.mutate({ kind: "text", text: t, ...pos });
     closeAdd();
   };
+  // 空白五行卡：不查线路、不调任何接口，点一下就落一张标准五行
+  // 到站卡到画布上，站名/线路/方向在卡上点着填，填好点刷新查车。
+  const addBlankStationModule = () => {
+    const pos = centerWorldPos();
+    addModuleMut.mutate({
+      kind: "station",
+      line: "",
+      station: "",
+      direction: 0,
+      terminal: "",
+      ...pos,
+    });
+    closeAdd();
+  };
 
   const modById = (id: number) => modules.find((m) => m.id === id);
 
@@ -3444,6 +3463,21 @@ function CanvasView({
             </button>
           </div>
 
+          <button
+            type="button"
+            onClick={addBlankStationModule}
+            disabled={addModuleMut.isPending}
+            aria-label="直接放一张空白到站卡到画布上"
+            className="mt-3 w-full border-2 border-dashed border-[var(--accent)] bg-[var(--surface2)] px-3 py-2.5 text-left [border-radius:8px] disabled:opacity-50"
+          >
+            <span className="text-base font-bold text-[var(--accent)]">
+              ＋ 直接放一张空白到站卡
+            </span>
+            <span className="mt-0.5 block text-xs text-[var(--dim)]">
+              现成的五行卡，不用查线路、不花额度；放到画布上点前三行选站名、线路、方向（能点选就不打字），选好点刷新查车。
+            </span>
+          </button>
+
           {addKind === "text" ? (
             <form
               className="mt-3 flex gap-2"
@@ -3489,10 +3523,32 @@ function CanvasView({
                 </button>
               </form>
               {ldMut.data && !ldMut.data.ok && (
-                <p className="mt-2 text-sm text-[var(--danger)]">{ldMut.data.error}</p>
+                <div className="mt-2">
+                  <p className="text-sm text-[var(--danger)]">{ldMut.data.error}</p>
+                  <button
+                    type="button"
+                    onClick={addBlankStationModule}
+                    disabled={addModuleMut.isPending}
+                    aria-label="改用空白卡自己填"
+                    className="mt-1.5 border border-[var(--accent)] px-3 py-1 text-sm font-bold text-[var(--accent)] [border-radius:8px] disabled:opacity-50"
+                  >
+                    改用空白卡自己填 →
+                  </button>
+                </div>
               )}
               {ldMut.isError && (
-                <p className="mt-2 text-sm text-[var(--danger)]">查线路失败：{String(ldMut.error)}</p>
+                <div className="mt-2">
+                  <p className="text-sm text-[var(--danger)]">查线路失败：{String(ldMut.error)}</p>
+                  <button
+                    type="button"
+                    onClick={addBlankStationModule}
+                    disabled={addModuleMut.isPending}
+                    aria-label="改用空白卡自己填"
+                    className="mt-1.5 border border-[var(--accent)] px-3 py-1 text-sm font-bold text-[var(--accent)] [border-radius:8px] disabled:opacity-50"
+                  >
+                    改用空白卡自己填 →
+                  </button>
+                </div>
               )}
               {ldMut.data?.ok && (
                 <div className="mt-3">
@@ -3790,6 +3846,18 @@ function CanvasView({
                         setLinkFrom(m.id);
                       }}
                       onSaveNote={(note) => updateModuleMut.mutate({ id: m.id, note })}
+                      onSaveStation={(station) =>
+                        updateModuleMut.mutate({ id: m.id, station })
+                      }
+                      onSaveLine={(line) =>
+                        // 换了线路，旧方向/终点站多半对不上，一并清掉重定
+                        updateModuleMut.mutate({
+                          id: m.id,
+                          line,
+                          direction: 0,
+                          terminal: "",
+                        })
+                      }
                       onToggleEnabled={(enabled) =>
                         updateModuleMut.mutate({ id: m.id, enabled })
                       }
@@ -3813,7 +3881,7 @@ function CanvasView({
 
             {modules.length === 0 && (
               <p className="absolute top-24 left-1/2 w-64 -translate-x-1/2 text-center text-sm leading-relaxed text-[var(--dim)]">
-                画布还是空的。点上面「＋ 加模块」，先加一张到站卡，再加文本卡、连线，一个个摆出你的路线图。
+                画布还是空的。点上面「＋ 加模块」，可以直接放一张空白到站卡自己填，也可以查线路选站加卡，再加文本卡、连线，一个个摆出你的路线图。
               </p>
             )}
           </div>
@@ -3821,7 +3889,7 @@ function CanvasView({
       )}
 
       <p className="mt-2 text-xs leading-relaxed text-[var(--dim)]">
-        拖模块本体移动它，拖空白处平移画布，双指或滚轮缩放。连线：按住模块右侧的蓝点拖到另一个模块上松手（虚线带箭头，按顺序连就是行程顺序）；模块右上角 ✕ 整删。到站卡可开始/停止：停止后变灰待机、不查车。打开画布不自动查车：有缓存先看缓存，每张到站卡点刷新只查它自己。
+        拖模块本体移动它，拖空白处平移画布，双指或滚轮缩放。连线：按住模块右侧的蓝点拖到另一个模块上松手（虚线带箭头，按顺序连就是行程顺序）；模块右上角 ✕ 整删。到站卡可开始/停止：停止后变灰待机、不查车。打开画布不自动查车：有缓存先看缓存，每张到站卡点刷新只查它自己。到站卡前三行（站名/线路/方向）点一下先出可选项点选——方向是终点站二选一、站名从站序里挑、线路从你用过的里面挑，实在没有选项才打字，选完自动保存；「＋ 加模块」里可以直接放一张空白卡，不用先查线路。
       </p>
     </section>
   );
@@ -3852,6 +3920,8 @@ function CanvasStationCard({
   entry,
   onStartLink,
   onSaveNote,
+  onSaveStation,
+  onSaveLine,
   onToggleEnabled,
   onSetDirection,
 }: {
@@ -3860,6 +3930,8 @@ function CanvasStationCard({
   entry: BoardEntry | undefined;
   onStartLink: () => void;
   onSaveNote: (note: string) => void;
+  onSaveStation: (station: string) => void;
+  onSaveLine: (line: string) => void;
   onToggleEnabled: (enabled: boolean) => void;
   onSetDirection: (direction: number, terminal: string) => void;
 }) {
@@ -3873,91 +3945,344 @@ function CanvasStationCard({
     : rtM.data?.ok
       ? rtM.data
       : (entry?.realtime ?? null);
+  // 方向未定：方向号 0 且没填终点站（空白卡留空、或从规划转入时定不下来）
+  const dirUnset = mod.direction === 0 && !mod.terminal;
   const dir =
     data?.directions.find((d) => d.direction === mod.direction) ??
     data?.directions.find((d) => d.terminal === mod.terminal) ??
-    null;
+    // 方向未定时先按返回数据展示：优先有车的方向，其次第一个方向
+    (dirUnset
+      ? (data?.directions.find((d) => d.buses.length > 0) ??
+        data?.directions[0] ??
+        null)
+      : null);
+  // 数据里的另一个方向：方向行点「换方向」切换过去，并记住选择
+  const otherDir =
+    data && dir
+      ? (data.directions.find((d) => d.direction !== dir.direction) ?? null)
+      : null;
   const error = stopped
     ? ""
     : (rtM.data && !rtM.data.ok ? rtM.data.error : "") ||
       (rtM.isError ? `查询失败：${String(rtM.error)}` : "");
-  // 从规划转入时方向没定下来的模块：方向号 0 且没有终点站可匹配
-  const needsDirection = mod.direction === 0 && !mod.terminal;
-  const [pickingDir, setPickingDir] = useState(false);
-  const ldMut = useMutation({
-    mutationFn: (line: string) => api.getLineDetail({ line, city }),
+  // 前三行就地编辑：点一行进入编辑，失焦/回车保存、Esc 取消，改完即存
+  const [editField, setEditField] = useState<"station" | "line" | "terminal" | null>(null);
+  const [draft, setDraft] = useState("");
+  const startEdit = (field: "station" | "line" | "terminal", value: string) => {
+    setEditField(field);
+    setDraft(value);
+  };
+  const commitEdit = () => {
+    if (!editField) return;
+    const v = draft.trim();
+    if (editField === "station" && v !== mod.station) onSaveStation(v);
+    // 「33」与已存的「33路」算同一条线，不触发保存（免得误清方向）
+    if (editField === "line" && v !== mod.line && `${v}路` !== mod.line) onSaveLine(v);
+    // 方向按终点站名存：同时把方向号清 0，查询结果按终点站匹配方向
+    if (editField === "terminal" && v !== mod.terminal) onSetDirection(0, v);
+    setEditField(null);
+  };
+  const editInput = (label: string) => (
+    <input
+      autoFocus
+      value={draft}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commitEdit}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+        if (e.key === "Escape") setEditField(null);
+      }}
+      aria-label={label}
+      className="w-full border border-[var(--accent)] bg-[var(--surface)] px-1.5 py-0.5 text-base text-[var(--text)] [border-radius:6px] outline-none"
+    />
+  );
+  // 点选优先、尽量不打字：点前三行先出可选项（方向=终点站二选一、
+  // 站名=站序列表、线路=用过的线路 chips），选项来自服务端沉淀缓存
+  // （不耗 apizero 额度）；实在没有选项才退回上面的打字输入。
+  const [picker, setPicker] = useState<"station" | "line" | "terminal" | null>(
+    null,
+  );
+  const pickQ = useQuery({
+    queryKey: ["linePickOptions", city, mod.line, mod.direction],
+    queryFn: () =>
+      api.getLinePickOptions({
+        city,
+        line: mod.line,
+        direction: mod.direction,
+      }),
+    enabled: picker === "station" || picker === "terminal",
   });
+  const recentQ = useQuery({
+    queryKey: ["linePickRecent", city],
+    queryFn: () => api.getLinePickOptions({ city }),
+    enabled: picker === "line",
+  });
+  // 终点站选项：服务端给的 + 这张卡已查到的实时结果自带的双向终点
+  const pickTerminals = Array.from(
+    new Set([
+      ...(pickQ.data?.terminals ?? []),
+      ...(data?.directions
+        .map((d) => d.terminal)
+        .filter((t) => t !== "") ?? []),
+    ]),
+  );
+  const pickStops = pickQ.data?.stops ?? [];
+  const recentLines = (recentQ.data?.recentLines ?? []).filter(
+    (l) => l !== mod.line,
+  );
+  // 选项查完确认一个都没有（或查询失败）时，才退回打字输入
+  useEffect(() => {
+    if (picker !== "terminal" && picker !== "station") return;
+    if (!pickQ.isSuccess && !pickQ.isError) return;
+    if (picker === "terminal" && pickTerminals.length === 0) {
+      setPicker(null);
+      startEdit("terminal", mod.terminal);
+    }
+    if (picker === "station" && pickStops.length === 0) {
+      setPicker(null);
+      startEdit("station", mod.station);
+    }
+    // 只在选项查询落定时判断一次，依赖取查询状态本身
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [picker, pickQ.isSuccess, pickQ.isError, pickQ.data]);
+  const pickerFooter = (field: "station" | "line" | "terminal") => (
+    <div className="mt-1.5 flex gap-1.5">
+      <button
+        type="button"
+        onClick={() => {
+          setPicker(null);
+          startEdit(field, field === "station" ? mod.station : field === "line" ? mod.line : mod.terminal);
+        }}
+        className="flex-1 border border-[var(--border)] bg-[var(--surface)] px-2 py-1 text-xs font-medium text-[var(--dim)] [border-radius:6px]"
+      >
+        手动输入
+      </button>
+      <button
+        type="button"
+        onClick={() => setPicker(null)}
+        className="flex-1 bg-[var(--surface)] px-2 py-1 text-xs font-medium text-[var(--dim)] [border-radius:6px]"
+      >
+        取消
+      </button>
+    </div>
+  );
 
   return (
     <div>
-      {/* 第 1 行：站名 */}
-      <div className="flex items-center gap-1.5">
-        <span className="min-w-0 flex-1 truncate text-base font-bold text-[var(--text)]">
-          {mod.station}
-        </span>
-        <CanvasCardActions
-          label={`${mod.line} ${mod.station}`}
-          onStartLink={onStartLink}
-        />
+      {/* 第 1 行：站名（点一下先从站序里点选，没有站序才打字） */}
+      <div>
+        <div className="flex items-center gap-1.5">
+          {editField === "station" ? (
+            <span className="min-w-0 flex-1">{editInput("站名，如：长虹路")}</span>
+          ) : (
+            <span
+              role="button"
+              tabIndex={0}
+              aria-label={mod.station ? `站名 ${mod.station}，点我选择站名` : "点我选择站名"}
+              onPointerDown={(e) => e.stopPropagation()}
+              onClick={() => setPicker(picker === "station" ? null : "station")}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") setPicker("station");
+              }}
+              className={`min-w-0 flex-1 truncate text-base font-bold ${
+                mod.station
+                  ? "text-[var(--text)] underline decoration-[var(--border)] decoration-dotted underline-offset-4"
+                  : "text-[var(--dim)]"
+              }`}
+            >
+              {mod.station || "点这里选站名"}
+            </span>
+          )}
+          <CanvasCardActions
+            label={`${mod.line} ${mod.station}`}
+            onStartLink={onStartLink}
+          />
+        </div>
+        {picker === "station" && editField !== "station" && (
+          <div
+            onPointerDown={(e) => e.stopPropagation()}
+            className="mt-1.5 border border-[var(--border)] bg-[var(--surface2)] p-1.5 [border-radius:8px]"
+          >
+            {pickQ.isLoading ? (
+              <p className="px-1 py-1 text-sm text-[var(--dim)]">
+                正在找这条线的站点…
+              </p>
+            ) : (
+              <>
+                <div className="flex max-h-36 flex-wrap gap-1.5 overflow-y-auto">
+                  {pickStops.map((s) => (
+                    <button
+                      key={s}
+                      type="button"
+                      onClick={() => {
+                        onSaveStation(s);
+                        setPicker(null);
+                      }}
+                      aria-label={`选择站名 ${s}`}
+                      className={`px-2.5 py-1 text-sm font-medium [border-radius:999px] ${
+                        s === mod.station
+                          ? "bg-[var(--accent)] text-[var(--accent-ink)]"
+                          : "border border-[var(--border)] bg-[var(--surface)] text-[var(--text)]"
+                      }`}
+                    >
+                      {s}
+                    </button>
+                  ))}
+                </div>
+                {pickerFooter("station")}
+              </>
+            )}
+          </div>
+        )}
       </div>
-      {/* 第 2 行：线路 */}
+      {/* 第 2 行：线路（点一下先出用过的线路 chips，新线路才打字） */}
       <div className="mt-1">
-        <LineBadge name={mod.line} />
+        {editField === "line" ? (
+          editInput("线路名，如：33路")
+        ) : mod.line ? (
+          <span
+            role="button"
+            tabIndex={0}
+            aria-label={`线路 ${mod.line}，点我选择线路`}
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={() => setPicker(picker === "line" ? null : "line")}
+            className="inline-block"
+          >
+            <LineBadge name={mod.line} />
+          </span>
+        ) : (
+          <span
+            role="button"
+            tabIndex={0}
+            aria-label="点我选择线路"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={() => setPicker(picker === "line" ? null : "line")}
+            className="inline-block border border-dashed border-[var(--border)] px-2 py-0.5 text-sm text-[var(--dim)] [border-radius:6px]"
+          >
+            点这里选线路
+          </span>
+        )}
+        {picker === "line" && editField !== "line" && (
+          <div
+            onPointerDown={(e) => e.stopPropagation()}
+            className="mt-1.5 border border-[var(--border)] bg-[var(--surface2)] p-1.5 [border-radius:8px]"
+          >
+            {recentQ.isLoading ? (
+              <p className="px-1 py-1 text-sm text-[var(--dim)]">
+                正在找你用过的线路…
+              </p>
+            ) : (
+              <>
+                {recentLines.length > 0 ? (
+                  <div className="flex flex-wrap gap-1.5">
+                    {recentLines.map((l) => (
+                      <button
+                        key={l}
+                        type="button"
+                        onClick={() => {
+                          onSaveLine(l);
+                          setPicker(null);
+                        }}
+                        aria-label={`选择线路 ${l}`}
+                        className="border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1 text-sm font-bold text-[var(--text)] [border-radius:999px]"
+                      >
+                        {l}
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="px-1 py-0.5 text-sm text-[var(--dim)]">
+                    还没有用过的线路，手动输入一条吧。
+                  </p>
+                )}
+                {pickerFooter("line")}
+              </>
+            )}
+          </div>
+        )}
       </div>
-      {/* 第 3 行：方向 */}
-      <p className="mt-1 truncate text-sm text-[var(--dim)]">
-        {needsDirection ? "方向还没定" : `开往 ${mod.terminal || dir?.terminal || "—"}`}
-      </p>
-
-      {needsDirection && !pickingDir && (
-        <button
-          type="button"
-          onClick={() => {
-            setPickingDir(true);
-            if (!ldMut.data && !ldMut.isPending) ldMut.mutate(mod.line);
-          }}
-          aria-label={`给 ${mod.line} 在 ${mod.station} 的模块选方向`}
-          className="mt-1.5 w-full border border-[var(--amber)] bg-[var(--amber-bg)] px-3 py-1 text-sm font-bold text-[var(--amber)] [border-radius:8px]"
-        >
-          点我选方向
-        </button>
-      )}
-      {needsDirection && pickingDir && (
-        <div className="mt-1.5">
-          {ldMut.isPending && <p className="text-sm text-[var(--dim)]">正在查这条线路的方向…</p>}
-          {ldMut.data && !ldMut.data.ok && (
-            <p className="text-sm text-[var(--danger)]">{ldMut.data.error}</p>
-          )}
-          {ldMut.isError && (
-            <p className="text-sm text-[var(--danger)]">查线路失败：{String(ldMut.error)}</p>
-          )}
-          {ldMut.data?.ok && (
-            <div className="flex flex-wrap gap-1.5">
-              {ldMut.data.directions.map((d) => (
-                <button
-                  key={d.direction}
-                  type="button"
-                  onClick={() => {
-                    onSetDirection(d.direction, d.end);
-                    setPickingDir(false);
-                  }}
-                  aria-label={`选方向：开往 ${d.end}`}
-                  className="bg-[var(--accent)] px-3 py-1 text-sm font-bold text-[var(--accent-ink)] [border-radius:8px]"
-                >
-                  开往 {d.end}
-                </button>
-              ))}
-              <button
-                type="button"
-                onClick={() => setPickingDir(false)}
-                className="bg-[var(--surface2)] px-3 py-1 text-sm font-medium text-[var(--text)] [border-radius:8px]"
+      {/* 第 3 行：方向（点一下出终点站大按钮二选一，可留空；有双向数据时可一键换方向） */}
+      <div className="mt-1">
+        <div className="flex items-center gap-1.5">
+          {editField === "terminal" ? (
+            <span className="min-w-0 flex-1">{editInput("方向终点站名，如：高崎公交场站，可留空")}</span>
+          ) : (
+            <>
+              <span
+                role="button"
+                tabIndex={0}
+                aria-label={
+                  mod.terminal || dir
+                    ? `方向开往 ${mod.terminal || dir?.terminal || ""}，点我选择方向`
+                    : "点我选择方向（终点站），也可以留空"
+                }
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={() => setPicker(picker === "terminal" ? null : "terminal")}
+                className="min-w-0 flex-1 truncate text-sm text-[var(--dim)] underline decoration-[var(--border)] decoration-dotted underline-offset-4"
               >
-                先不选
-              </button>
-            </div>
+                {mod.terminal
+                  ? `开往 ${mod.terminal}`
+                  : dir
+                    ? `开往 ${dir.terminal}`
+                    : "方向未填（点我选，可留空）"}
+              </span>
+              {otherDir && (
+                <button
+                  type="button"
+                  onClick={() => onSetDirection(otherDir.direction, otherDir.terminal)}
+                  aria-label={`换方向：改看开往 ${otherDir.terminal} 的车`}
+                  className="shrink-0 bg-[var(--surface2)] px-2 py-0.5 text-xs font-medium text-[var(--accent)] [border-radius:999px]"
+                >
+                  ⇄ 换方向
+                </button>
+              )}
+            </>
           )}
         </div>
-      )}
+        {picker === "terminal" && editField !== "terminal" && (
+          <div
+            onPointerDown={(e) => e.stopPropagation()}
+            className="mt-1.5 border border-[var(--border)] bg-[var(--surface2)] p-1.5 [border-radius:8px]"
+          >
+            {pickQ.isLoading ? (
+              <p className="px-1 py-1 text-sm text-[var(--dim)]">
+                正在找这条线的终点站…
+              </p>
+            ) : pickQ.isError ? (
+              <>
+                <p className="px-1 py-0.5 text-sm text-[var(--dim)]">
+                  终点站选项没取到，可以手动输入。
+                </p>
+                {pickerFooter("terminal")}
+              </>
+            ) : (
+              <>
+                <div className="flex flex-col gap-1.5">
+                  {pickTerminals.map((t) => (
+                    <button
+                      key={t}
+                      type="button"
+                      onClick={() => {
+                        onSetDirection(0, t);
+                        setPicker(null);
+                      }}
+                      aria-label={`选择方向：开往 ${t}`}
+                      className={`min-h-[2.5rem] px-2.5 py-1.5 text-left text-base font-bold [border-radius:8px] ${
+                        t === mod.terminal
+                          ? "bg-[var(--accent)] text-[var(--accent-ink)]"
+                          : "border border-[var(--accent)] bg-[var(--surface)] text-[var(--text)]"
+                      }`}
+                    >
+                      开往 {t}
+                    </button>
+                  ))}
+                </div>
+                {pickerFooter("terminal")}
+              </>
+            )}
+          </div>
+        )}
+      </div>
 
       {stopped ? (
         <p className="mt-1.5 text-sm text-[var(--dim)]">
@@ -3967,7 +4292,11 @@ function CanvasStationCard({
         <>
           {error && <p className="mt-1.5 text-sm text-[var(--danger)]">{error}</p>}
           {!data && !error && (
-            <p className="mt-1.5 text-sm text-[var(--dim)]">还没查过，点刷新看现在有没有车。</p>
+            <p className="mt-1.5 text-sm text-[var(--dim)]">
+              {mod.line && mod.station
+                ? "还没查过，点刷新看现在有没有车。"
+                : "先点上面第 1、2 行把站名和线路填好，再点刷新查车。"}
+            </p>
           )}
           {data && !dir && !error && (
             <p className="mt-1.5 text-sm text-[var(--dim)]">这个方向暂时没有查到数据。</p>
@@ -4039,7 +4368,7 @@ function CanvasStationCard({
         <button
           type="button"
           onClick={() => rtM.mutate()}
-          disabled={stopped || rtM.isPending}
+          disabled={stopped || rtM.isPending || !mod.line || !mod.station}
           aria-label={`刷新 ${mod.line} 在 ${mod.station} 的实时到站`}
           className="shrink-0 bg-[var(--accent)] px-3 py-1 text-sm font-bold text-[var(--accent-ink)] [border-radius:8px] disabled:opacity-40"
         >

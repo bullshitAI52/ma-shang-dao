@@ -80,6 +80,13 @@
 - **方向推导（零额外 apizero 调用）**: planRoute 的乘车段新增 terminal 字段——从高德线路名括号「(起点--终点)」解析行进方向终点站（方案数据本身自带）；import 时先用该终点站与服务端 12 小时站点序缓存（只读、fetchIfMissing=false）核对方向号，核对出就存 direction+terminal；只对上终点站对不上号时存 terminal、direction=0，卡片查询时按终点站匹配方向；两者都没有的模块 direction=0 且无 terminal，卡片上亮琥珀色「点我选方向」，用户点开才查一次线路详情选方向（updateCanvasModule 可写 direction/terminal）
 - **整删入口**: 每个模块右上角固定 36px 的 ✕ 按钮，点后模块顶部出确认条（删除/取消），确认才整删并连带删线（服务端原有逻辑不变）
 - **五行结构（2026-11-18 三轮）**: 到站卡按草图行结构明确成五行——第 1 行站名、第 2 行线路徽章、第 3 行方向（开往 X）、第 4 行第 1 班（还有 N 站 · 约 M 分钟 + 预计到站时刻）、第 5 行第 2 班（标注「第 2 班」，格式与第 4 行一致）；只有一班或已过末班时第 5 行如实显示「暂无」，零班时第 4 行「暂无车」、第 5 行「暂无」。数据仍走原有实时查询与 90 秒缓存，不新增接口调用；原先最多显示 3 班的列表收成这两行
+- **空白五行卡（2026-11-18 四轮）**: 起因——加模块向导必须先「查线路」拉站序，apizero 额度用完（4030）时直接报错、模块建不了、画布一直空。改法：①加模块面板顶部加醒目按钮「＋ 直接放一张空白到站卡」，走既有 addCanvasModule 传空 line/station/direction=0/terminal=""，创建不调任何接口；向导「查线路」失败（data.ok=false 或请求异常）时错误旁同样给「改用空白卡自己填 →」一键转空白卡。②到站卡前三行就地编辑（向导建的卡同样适用）：点站名/线路/方向行变输入框，失焦/回车保存、Esc 取消；updateCanvasModule 新增 line/station 可改字段（line 服务端 normalizeLine 补「路」），改线路时客户端一并清 direction/terminal 重定，方向按终点站名存（保存时 direction 清 0、靠终点站匹配）。③方向可留空：direction=0 且无 terminal 时，刷新拿到双向数据后默认展示（优先有车的方向），方向行旁「⇄ 换方向」在双向间切换并经 updateCanvasModule 记住选择；原「点我选方向」查线路详情流程就此移除（改由实时数据切换，接口调用次数不变）。④空白卡线路/站名未填齐时刷新禁用并给填写提示，填齐后走既有 queryLineRealtime 按名查询，额度错误如实显示、模块与已填内容不丢；空白卡不进打开画布的缓存快照查询。空白卡与向导卡同权：拖动/连线/开始停止/备注/整删/自动保存全一致
+
+### 画布点选不打字（2026-11-18 五轮）
+- **需求**: 用户原话「33终点站可以选择的不，尽量不打字」——空白卡/就地编辑时方向（终点站）要能选不要打字，站名与线路同理
+- **点选缓存（line_pick_cache 表，迁移 0010）**: 按「城市+线路」沉淀 terminals（终点站数组）、stops1/stops2（双向站序）、extra_stations（零散站名）。沉淀来源：getLineStops 实查站序、getLineDetail 的起讫站+站序、queryLineRealtime/queryStationArrivals 结果自带的终点站与官方站名、importPlanToCanvas 方案带的终点站与上车站、addCanvasModule 向导选定值、updateCanvasModule 里用户手填/点选的终点站与站名。沉淀失败不挡主流程
+- **取选项动作 getLinePickOptions**: 优先读点选缓存 + 站序内存长缓存；终点站全无时用高德 /v3/bus/linename 检索兜底一次（基础名与线路完全一致才取 start_stop/end_stop/busstops，结果回沉淀）；全程不调 apizero、零实时额度。另返回 recentLines（画布模块用过的线路 + 收藏的线路/线路站点，按新近排序去重、上限 12）供线路 chips
+- **卡上交互**: 点站名行→站序 chips 点选；点线路行→recentLines chips 点选；点方向行→终点站大按钮（「开往 X」）二选一，另并入该卡已查实时结果自带的双向终点。手填输入降为面板底部「手动输入」次要入口；选项查询落定且为空/失败时自动退回手填。落库口径不变（方向仍存 terminal + direction=0 按终点站匹配，选线路仍连带清方向）
 
 ## Long-term data behavior
 - **Refresh policy**: 无定时刷新、无自动轮询；所有实时数据只在用户主动查询/点刷新时向 API 拉取（apizero 按次计费）

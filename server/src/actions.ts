@@ -365,6 +365,10 @@ async function getLineStops(
         expiresAt: Date.now() + STOPS_CACHE_TTL_MS,
         value: stops,
       });
+      // 顺带沉淀进点选缓存：这条线的站序与终点站以后可直接点选
+      await rememberLineInfo(ctx, city, line, {
+        directionStops: { direction, stops },
+      });
     }
     return stops;
   } catch {
@@ -378,6 +382,212 @@ function nextStopOf(stops: string[] | null, station: string): string {
   const i = stops.indexOf(station);
   if (i < 0 || i >= stops.length - 1) return "";
   return stops[i + 1] ?? "";
+}
+
+// ---------- 线路点选缓存（终点站/站序沉淀，尽量不打字） ----------
+// 画布到站卡选方向/站名时要「点选不要打字」，选项不能现查 apizero
+// （额度金贵）。办法：凡是别处已经查到过的线路信息——查线路详情与
+// 站序、实时结果自带的终点站、规划方案带的终点站、高德线路检索的
+// 起讫站、用户手填过的终点站/站名——都按「城市+线路」沉淀进
+// line_pick_cache 表，下次同线路直接可选。沉淀失败不挡主流程。
+
+type LineInfo = {
+  terminals: string[];
+  stops1: string[];
+  stops2: string[];
+  extraStations: string[];
+};
+
+function parseStrArr(json: string): string[] {
+  try {
+    const v: unknown = JSON.parse(json);
+    return Array.isArray(v)
+      ? v.filter((x): x is string => typeof x === "string" && x !== "")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function mergeNames(base: string[], add: string[], cap: number): string[] {
+  const out = [...base];
+  for (const n of add) {
+    const t = n.trim();
+    if (t && !out.includes(t)) out.push(t);
+  }
+  return out.slice(0, cap);
+}
+
+async function readLineInfo(
+  ctx: Ctx,
+  city: string,
+  line: string,
+): Promise<LineInfo> {
+  const empty: LineInfo = {
+    terminals: [],
+    stops1: [],
+    stops2: [],
+    extraStations: [],
+  };
+  if (!line) return empty;
+  try {
+    const db = ctx.db<typeof schema>();
+    const rows = await db
+      .select()
+      .from(schema.linePickCache)
+      .where(
+        and(
+          eq(schema.linePickCache.city, city),
+          eq(schema.linePickCache.line, line),
+        ),
+      )
+      .limit(1);
+    const r = rows[0];
+    if (!r) return empty;
+    return {
+      terminals: parseStrArr(r.terminalsJson),
+      stops1: parseStrArr(r.stops1Json),
+      stops2: parseStrArr(r.stops2Json),
+      extraStations: parseStrArr(r.extraStationsJson),
+    };
+  } catch {
+    return empty;
+  }
+}
+
+/** 把新查到/用户填入的线路信息合并进点选缓存（有更新才写库）。 */
+async function rememberLineInfo(
+  ctx: Ctx,
+  city: string,
+  line: string,
+  patch: {
+    terminals?: string[];
+    directionStops?: { direction: number; stops: string[] };
+    extraStations?: string[];
+  },
+): Promise<void> {
+  if (!line) return;
+  try {
+    const cur = await readLineInfo(ctx, city, line);
+    const next: LineInfo = {
+      terminals: patch.terminals
+        ? mergeNames(cur.terminals, patch.terminals, 6)
+        : cur.terminals,
+      stops1:
+        patch.directionStops?.direction === 1 &&
+        patch.directionStops.stops.length > 0
+          ? patch.directionStops.stops
+          : cur.stops1,
+      stops2:
+        patch.directionStops?.direction === 2 &&
+        patch.directionStops.stops.length > 0
+          ? patch.directionStops.stops
+          : cur.stops2,
+      extraStations: patch.extraStations
+        ? mergeNames(cur.extraStations, patch.extraStations, 80)
+        : cur.extraStations,
+    };
+    // 站序的首末站本身就是两个终点站，一并沉淀
+    for (const stops of [next.stops1, next.stops2]) {
+      if (stops.length > 0) {
+        next.terminals = mergeNames(
+          next.terminals,
+          [stops[0] ?? "", stops[stops.length - 1] ?? ""],
+          6,
+        );
+      }
+    }
+    if (
+      JSON.stringify(next) ===
+      JSON.stringify({
+        terminals: cur.terminals,
+        stops1: cur.stops1,
+        stops2: cur.stops2,
+        extraStations: cur.extraStations,
+      })
+    ) {
+      return;
+    }
+    const db = ctx.db<typeof schema>();
+    const values = {
+      city,
+      line,
+      terminalsJson: JSON.stringify(next.terminals),
+      stops1Json: JSON.stringify(next.stops1),
+      stops2Json: JSON.stringify(next.stops2),
+      extraStationsJson: JSON.stringify(next.extraStations),
+      updatedAt: new Date(),
+    };
+    await db
+      .insert(schema.linePickCache)
+      .values(values)
+      .onConflictDoUpdate({
+        target: [schema.linePickCache.city, schema.linePickCache.line],
+        set: {
+          terminalsJson: values.terminalsJson,
+          stops1Json: values.stops1Json,
+          stops2Json: values.stops2Json,
+          extraStationsJson: values.extraStationsJson,
+          updatedAt: values.updatedAt,
+        },
+      });
+  } catch {
+    // 沉淀只是锦上添花，失败不影响查询主流程
+  }
+}
+
+/**
+ * 高德线路检索兜底（不耗 apizero 额度）：按线路名查 /v3/bus/linename，
+ * 基础名与目标线路完全一致的条目取起讫站作终点站、busstops 作站序。
+ * 高德返回双向两条，顺序不保证与 apizero 方向号一致——点选场景只
+ * 需要「有哪些终点站/站点」，方向号仍按终点站名匹配，不受影响。
+ */
+async function amapLineInfo(
+  ctx: Ctx,
+  city: string,
+  line: string,
+): Promise<LineInfo | null> {
+  try {
+    const d = await amap(ctx, "/v3/bus/linename", {
+      keywords: line,
+      city,
+      extensions: "all",
+      offset: "25",
+      page: "1",
+    });
+    if (str(d.status) !== "1") return null;
+    const info: LineInfo = {
+      terminals: [],
+      stops1: [],
+      stops2: [],
+      extraStations: [],
+    };
+    let dirIdx = 0;
+    for (const raw of arr(d.buslines)) {
+      const b = rec(raw);
+      const full = str(b.name);
+      const base = (full.split(/[(（]/)[0] ?? full).trim();
+      if (base !== line) continue;
+      info.terminals = mergeNames(
+        info.terminals,
+        [str(b.start_stop), str(b.end_stop)],
+        6,
+      );
+      const stops = arr(b.busstops)
+        .map((s) => str(rec(s).name))
+        .filter((n) => n !== "");
+      if (stops.length > 0 && dirIdx === 0 && info.stops1.length === 0) {
+        info.stops1 = stops;
+        dirIdx = 1;
+      } else if (stops.length > 0 && info.stops2.length === 0) {
+        info.stops2 = stops;
+      }
+    }
+    if (info.terminals.length === 0 && info.stops1.length === 0) return null;
+    return info;
+  } catch {
+    return null;
+  }
 }
 
 // ---------- 地铁线路 ----------
@@ -650,6 +860,15 @@ const lineDetailResponse = z.object({
       stops: z.array(z.string()),
     }),
   ),
+});
+
+// 画布到站卡「点选」用的选项：某线路已知的终点站（方向二选一）、
+// 站序（点选站名）与最近用过的线路（点选线路 chips）。全部来自服务
+// 端沉淀缓存/站序缓存/高德线路检索，不调 apizero。
+const linePickOptionsResponse = z.object({
+  terminals: z.array(z.string()),
+  stops: z.array(z.string()),
+  recentLines: z.array(z.string()),
 });
 
 const lineRealtimeResponse = z.object({
@@ -1255,6 +1474,14 @@ export const Actions = {
             expiresAt: Date.now() + STOPS_CACHE_TTL_MS,
             value: stops.filter((n) => n !== ""),
           });
+          // 起讫站与站序沉淀进点选缓存，画布选方向/站名时可直接点
+          await rememberLineInfo(ctx, city, line, {
+            terminals: [str(d.start), str(d.end)],
+            directionStops: {
+              direction,
+              stops: stops.filter((n) => n !== ""),
+            },
+          });
         }
         return {
           direction,
@@ -1364,6 +1591,11 @@ export const Actions = {
         };
         // 全部方向都失败的结果不进缓存，避免把短暂故障存进缓存
         if (directions.some((d) => !d.error)) await cacheSet(ctx, cacheKey, result);
+        // 实时结果自带的双向终点站与匹配到的官方站名沉淀进点选缓存
+        await rememberLineInfo(ctx, city, line, {
+          terminals: directions.map((d) => d.terminal),
+          extraStations: [station],
+        });
         return result;
       } catch (e) {
         return { ...empty, error: errMsg(e) };
@@ -1471,6 +1703,18 @@ export const Actions = {
         };
         // 全部方向都失败的结果不进缓存，避免把短暂故障存进缓存
         if (directions.some((d) => !d.error)) await cacheSet(ctx, cacheKey, result);
+        // 每条经过线路的终点站与本站名沉淀进点选缓存
+        const seenLines = new Set<string>();
+        for (const d of directions) {
+          for (const ln of d.lines) {
+            if (!ln.line || seenLines.has(ln.line)) continue;
+            seenLines.add(ln.line);
+            await rememberLineInfo(ctx, city, ln.line, {
+              terminals: [ln.terminal],
+              extraStations: [station],
+            });
+          }
+        }
         return result;
       } catch (e) {
         return { ok: false, error: errMsg(e), ...base };
@@ -1978,6 +2222,103 @@ export const Actions = {
     },
   }),
 
+  getLinePickOptions: defineAction({
+    description:
+      "给画布到站卡「点选不打字」用的选项：某线路已知的终点站（选方向用）与站序（选站名用），外加当前城市最近用过的线路（选线路 chips 用）。数据优先读服务端点选沉淀缓存与站序长缓存，都没有终点站时用高德线路检索兜底（结果会沉淀下来）；全程不调 apizero、不耗实时额度。line 可空（只取 recentLines）。direction 是卡片当前方向号，用来决定站序先给哪个方向。",
+    request: z.object({
+      line: z.string().max(20).optional(),
+      direction: z.number().int().min(0).max(2).optional(),
+      city: z.string().max(20).optional(),
+    }),
+    response: linePickOptionsResponse,
+    privileged: [privileged.amapGet],
+    async handler(ctx, args): Promise<z.infer<typeof linePickOptionsResponse>> {
+      const city = cityOf(args.city);
+      const line = normalizeLine(args.line ?? "");
+      const db = ctx.db<typeof schema>();
+      // 最近用过的线路：画布模块里用过的 + 收藏过的（线路/线路站点）
+      const recentLines: string[] = [];
+      const pushRecent = (v: string) => {
+        const t = v.trim();
+        if (t && !recentLines.includes(t) && recentLines.length < 12) {
+          recentLines.push(t);
+        }
+      };
+      const mods = await db
+        .select({ line: schema.canvasModules.line })
+        .from(schema.canvasModules)
+        .where(
+          and(
+            eq(schema.canvasModules.city, city),
+            eq(schema.canvasModules.kind, "station"),
+          ),
+        )
+        .orderBy(desc(schema.canvasModules.id))
+        .limit(100);
+      for (const m of mods) pushRecent(m.line);
+      const favs = await db
+        .select({
+          kind: schema.favorites.kind,
+          value: schema.favorites.value,
+        })
+        .from(schema.favorites)
+        .where(eq(schema.favorites.city, city))
+        .orderBy(desc(schema.favorites.id))
+        .limit(100);
+      for (const f of favs) {
+        if (f.kind === "line" || f.kind === "lineStation") {
+          pushRecent(normalizeLine(f.value));
+        }
+      }
+      if (!line) return { terminals: [], stops: [], recentLines };
+
+      const info = await readLineInfo(ctx, city, line);
+      // 站序内存长缓存里有的也算数（与沉淀表互补）
+      for (const dir of [1, 2] as const) {
+        const e = stopsCache.get(`${city}|${line}|${dir}`);
+        if (e && Date.now() <= e.expiresAt && e.value.length > 0) {
+          if (dir === 1 && info.stops1.length === 0) info.stops1 = e.value;
+          if (dir === 2 && info.stops2.length === 0) info.stops2 = e.value;
+          info.terminals = mergeNames(
+            info.terminals,
+            [e.value[0] ?? "", e.value[e.value.length - 1] ?? ""],
+            6,
+          );
+        }
+      }
+      // 沉淀与缓存都没有终点站时，高德线路检索兜底一次并沉淀
+      if (info.terminals.length === 0) {
+        const am = await amapLineInfo(ctx, city, line);
+        if (am) {
+          info.terminals = mergeNames(info.terminals, am.terminals, 6);
+          if (info.stops1.length === 0) info.stops1 = am.stops1;
+          if (info.stops2.length === 0) info.stops2 = am.stops2;
+          await rememberLineInfo(ctx, city, line, {
+            terminals: am.terminals,
+            directionStops:
+              am.stops1.length > 0
+                ? { direction: 1, stops: am.stops1 }
+                : undefined,
+          });
+          if (am.stops2.length > 0) {
+            await rememberLineInfo(ctx, city, line, {
+              directionStops: { direction: 2, stops: am.stops2 },
+            });
+          }
+        }
+      }
+      // 站序：优先卡片当前方向的，其次另一个方向；再补零散记下的站名
+      const want = args.direction === 2 ? info.stops2 : info.stops1;
+      const other = args.direction === 2 ? info.stops1 : info.stops2;
+      const stops = mergeNames(
+        [...(want.length > 0 ? want : other)],
+        [...other, ...info.extraStations],
+        120,
+      );
+      return { terminals: info.terminals, stops, recentLines };
+    },
+  }),
+
   getCanvas: defineAction({
     description:
       "读取某城市画布的全部模块（到站卡/文本卡，含位置与备注）与连线。厦门画布为空且从未初始化时，先按用户通勤草图一次性预置种子（方向按线路站序实查判定，判定不了的模块不预置；用户删空后不再自动补）。city 缺省为厦门。",
@@ -1993,7 +2334,7 @@ export const Actions = {
 
   addCanvasModule: defineAction({
     description:
-      "往某城市画布加一个模块：kind=station 时给 line/station/direction（接口方向号 1/2）/terminal（该方向终点站），kind=text 时给 text（纯文字内容）；x/y 是画布世界坐标。返回该城市画布全量。city 缺省为厦门。",
+      "往某城市画布加一个模块：kind=station 时给 line/station/direction（接口方向号 1/2）/terminal（该方向终点站），kind=text 时给 text（纯文字内容）；x/y 是画布世界坐标。line/station/terminal 都可留空——那就是一张空白五行到站卡，创建不调任何接口，之后在卡上就地填字（updateCanvasModule 改 line/station/terminal）。返回该城市画布全量。city 缺省为厦门。",
     request: z.object({
       kind: z.enum(["station", "text"]),
       line: z.string().max(20).optional(),
@@ -2022,13 +2363,23 @@ export const Actions = {
         x: args.x,
         y: args.y,
       });
+      // 向导选定的终点站/站名也沉淀进点选缓存
+      if (args.kind === "station") {
+        const line = normalizeLine(args.line ?? "");
+        if (line) {
+          await rememberLineInfo(ctx, city, line, {
+            terminals: args.terminal?.trim() ? [args.terminal.trim()] : [],
+            extraStations: args.station?.trim() ? [args.station.trim()] : [],
+          });
+        }
+      }
       return listCanvas(ctx, city);
     },
   }),
 
   updateCanvasModule: defineAction({
     description:
-      "更新画布模块：传 x/y 改位置（拖动结束时保存），传 note 改备注，传 text 改文本模块的文字，传 enabled 开/停到站模块（停止后不查实时），传 direction/terminal 补选方向（从规划转入时方向定不了的模块用）；没传的字段不动。返回该城市画布全量。city 缺省为厦门。",
+      "更新画布模块：传 x/y 改位置（拖动结束时保存），传 note 改备注，传 text 改文本模块的文字，传 enabled 开/停到站模块（停止后不查实时），传 direction/terminal 补选方向（从规划转入时方向定不了的模块用），传 line/station 改到站模块的线路与站名（空白卡就地填写用，line 会按规范补「路」后缀）；没传的字段不动。返回该城市画布全量。city 缺省为厦门。",
     request: z.object({
       id: z.number().int().positive(),
       x: z.number().min(-10000).max(10000).optional(),
@@ -2038,6 +2389,8 @@ export const Actions = {
       enabled: z.boolean().optional(),
       direction: z.number().int().min(0).max(2).optional(),
       terminal: z.string().max(40).optional(),
+      line: z.string().max(20).optional(),
+      station: z.string().max(40).optional(),
       city: z.string().max(20).optional(),
     }),
     response: canvasResponse,
@@ -2052,11 +2405,31 @@ export const Actions = {
       if (args.enabled !== undefined) set.enabled = args.enabled ? 1 : 0;
       if (args.direction !== undefined) set.direction = args.direction;
       if (args.terminal !== undefined) set.terminal = args.terminal.trim();
+      if (args.line !== undefined) set.line = normalizeLine(args.line);
+      if (args.station !== undefined) set.station = args.station.trim();
       if (Object.keys(set).length > 0) {
         await db
           .update(schema.canvasModules)
           .set(set)
           .where(eq(schema.canvasModules.id, args.id));
+      }
+      // 用户在卡上填/选的终点站与站名沉淀进点选缓存：下次同线路的卡
+      // 直接点选，不用再打字。线路以更新后的值为准。
+      if (args.terminal?.trim() || args.station?.trim()) {
+        const rows = await db
+          .select({ line: schema.canvasModules.line })
+          .from(schema.canvasModules)
+          .where(eq(schema.canvasModules.id, args.id))
+          .limit(1);
+        const lineNow = rows[0]?.line ?? "";
+        if (lineNow) {
+          await rememberLineInfo(ctx, city, lineNow, {
+            terminals: args.terminal?.trim() ? [args.terminal.trim()] : [],
+            extraStations: args.station?.trim()
+              ? [args.station.trim()]
+              : [],
+          });
+        }
       }
       return listCanvas(ctx, city);
     },
@@ -2269,6 +2642,13 @@ export const Actions = {
             // 但终点站若与缓存里某方向的末站对不上（缓存旧/异名），
             // 保持原样让用户点选修正，不硬改。
           }
+        }
+        // 方案自带的终点站与上车站沉淀进点选缓存，下次同线路可点选
+        if (line) {
+          await rememberLineInfo(ctx, city, normalizeLine(line), {
+            terminals: terminal ? [terminal] : [],
+            extraStations: station ? [station] : [],
+          });
         }
         specs.push({
           kind: "station",

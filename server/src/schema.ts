@@ -2,7 +2,13 @@
 // All transit data itself is fetched live from the upstream APIs and is
 // never persisted.
 
-import { integer, real, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import {
+  integer,
+  primaryKey,
+  real,
+  sqliteTable,
+  text,
+} from "drizzle-orm/sqlite-core";
 
 export const favorites = sqliteTable("favorites", {
   id: integer("id").primaryKey({ autoIncrement: true }),
@@ -105,6 +111,29 @@ export const canvasLinks = sqliteTable("canvas_links", {
     .notNull()
     .$defaultFn(() => new Date()),
 });
+
+// 线路点选缓存：按「城市 + 线路」沉淀这条线已知的终点站与站序，供
+// 画布到站卡点选方向/站名用（尽量不打字、且取选项不消耗 apizero 额
+// 度）。来源：查线路详情/站序时顺带记、实时查询结果自带的终点站、
+// 规划转画布时方案带的终点站、高德线路检索的起讫站、用户手填过的
+// 终点站与站名——谁先查到就存下来，之后同线路直接可选。
+// terminals_json 是终点站名数组；stops1/stops2_json 是两个方向的站
+// 序数组；extra_stations_json 是没有方向站序时零散记下的站名数组。
+export const linePickCache = sqliteTable(
+  "line_pick_cache",
+  {
+    city: text("city").notNull(),
+    line: text("line").notNull(),
+    terminalsJson: text("terminals_json").notNull().default("[]"),
+    stops1Json: text("stops1_json").notNull().default("[]"),
+    stops2Json: text("stops2_json").notNull().default("[]"),
+    extraStationsJson: text("extra_stations_json").notNull().default("[]"),
+    updatedAt: integer("updated_at", { mode: "timestamp_ms" })
+      .notNull()
+      .$defaultFn(() => new Date()),
+  },
+  (t) => [primaryKey({ columns: [t.city, t.line] })],
+);
 
 // 进行中的行程：全表只存一行（id 固定 1），同时只能有一个进行中行程。
 // segments_json 存所选方案各段的富化信息（线路/上车/下车/站点序切片），
