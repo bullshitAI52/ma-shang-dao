@@ -3040,12 +3040,12 @@ function clampScale(k: number): number {
   return Math.min(2.5, Math.max(0.3, k));
 }
 
-// 纵向流的链推导：按连线关系把模块排成一条条链。链头 = 有连线但
+// 连线链推导：按连线关系把模块排成一条条链。链头 = 有连线但
 // 没有入边的模块；从链头沿出边（按连线 id 顺序取第一条未走过的）
 // 一路走到底。分支的另一条边、环等剩余的已连线模块再各自成组；
 // 完全没有连线的模块最后单独成组（loose，chain=false）。
-// 流模式的顺序只由连线推导、不另存：调序即改写连线（见 reorderMut），
-// 自由画布的 x/y 坐标完全不受影响。
+// 路线树升级后，纵向流改由 parentId 成树（见 buildCanvasTree）；
+// 这套连线顺序只剩自由画布的步号徽章在用。
 type FlowGroup = {
   modules: CanvasModule[];
   pathLinkIds: number[];
@@ -3107,6 +3107,77 @@ function buildFlowGroups(
   return groups;
 }
 
+// 纵向流的路线树：模块按 parentId 挂接成树（类二叉树）——parentId=0
+// （或指向不存在的卡，防御性兜底）为顶层，顶层之间是主线顺序
+// （然后）；子卡是父卡分出的不同路线，同一父卡的子卡之间是备选
+// （或），子卡还能再挂子卡。同层顺序按 stepIndex 再按 id（创建先
+// 后）：迁移前的步序原样保留，新卡（stepIndex 更大）排在同层最后。
+type CanvasTreeNode = { mod: CanvasModule; children: CanvasTreeNode[] };
+
+function buildCanvasTree(mods: CanvasModule[]): CanvasTreeNode[] {
+  const byId = new Map(mods.map((m) => [m.id, m]));
+  const kidsOf = new Map<number, CanvasModule[]>();
+  const roots: CanvasModule[] = [];
+  for (const m of mods) {
+    if (m.parentId > 0 && m.parentId !== m.id && byId.has(m.parentId)) {
+      const arr = kidsOf.get(m.parentId) ?? [];
+      arr.push(m);
+      kidsOf.set(m.parentId, arr);
+    } else {
+      roots.push(m);
+    }
+  }
+  const byStepThenId = (a: CanvasModule, b: CanvasModule) =>
+    a.stepIndex - b.stepIndex || a.id - b.id;
+  const seen = new Set<number>();
+  const build = (m: CanvasModule): CanvasTreeNode => {
+    seen.add(m.id);
+    const kids = (kidsOf.get(m.id) ?? [])
+      .filter((k) => !seen.has(k.id))
+      .sort(byStepThenId);
+    return { mod: m, children: kids.map(build) };
+  };
+  const tree = roots.sort(byStepThenId).map(build);
+  // 互相挂接成环的卡（服务端已防环，这里兜底）：没被任何树根触达
+  // 的按顶层补在最后，保证每张卡都渲染得出来
+  for (const m of mods.filter((x) => !seen.has(x.id)).sort(byStepThenId)) {
+    tree.push(build(m));
+  }
+  return tree;
+}
+
+// 子树里卡的总数（折叠摘要的「后面还有 N 张卡」用）
+function treeDescendantCount(node: CanvasTreeNode): number {
+  return node.children.reduce(
+    (n, c) => n + 1 + treeDescendantCount(c),
+    0,
+  );
+}
+
+// 子树的全部后代 id（挂接选父卡时排除自己与子孙，防环）
+function treeDescendantIds(node: CanvasTreeNode): Set<number> {
+  const out = new Set<number>();
+  const walk = (n: CanvasTreeNode) => {
+    for (const c of n.children) {
+      out.add(c.mod.id);
+      walk(c);
+    }
+  };
+  walk(node);
+  return out;
+}
+
+// 卡的一行摘要名：到站卡「站名 · 线路」，文本卡用文字本身
+function canvasModLabel(m: CanvasModule): string {
+  if (m.kind === "station") {
+    const line = m.line.trim();
+    const st = m.station.trim();
+    if (line && st) return `${st} · ${line}`;
+    return line || st || "未填的到站卡";
+  }
+  return m.text.trim() || "未填的文本卡";
+}
+
 function CanvasView({
   city,
   onBack,
@@ -3155,17 +3226,11 @@ function CanvasView({
   }, [canvasQ.data]);
   const modules = canvasQ.data?.modules ?? [];
   const links = canvasQ.data?.links ?? [];
-  const modulesRef = useRef(modules);
-  modulesRef.current = modules;
-  const linksRef = useRef(links);
-  linksRef.current = links;
 
   // 显示模式：自由画布（free）/ 纵向流（flow）。选择按「城市+项目」
   // 记在 localStorage；没记过的项目，窄屏（<640px）默认纵向流、
   // 宽屏默认自由画布。
   const [canvasMode, setCanvasMode] = useState<"free" | "flow">("flow");
-  const canvasModeRef = useRef(canvasMode);
-  canvasModeRef.current = canvasMode;
   const modeProjectRef = useRef(0);
   useEffect(() => {
     if (!curProjectId || modeProjectRef.current === curProjectId) return;
@@ -3187,11 +3252,12 @@ function CanvasView({
       // 存不下不影响本次切换
     }
   };
-  // 纵向流分组：由连线推导（buildFlowGroups），渲染与调序共用
+  // 连线推导的顺序与步骤分组：路线树升级后只供自由画布的步号徽章
+  // 用（第X步/方案A/B），纵向流的结构改由 parentId 路线树决定。
   const flowGroups = buildFlowGroups(modules, links);
-  // 步骤分组：把流顺序压平，连续同 stepIndex 的卡归为一步——同一步
-  // 是备选（或），步与步之间是先后（然后）。显示的「第 X 步」用步组
-  // 在序列中的序号（stepIndex 只是分组键、允许空缺，序号永远连续）。
+  // 步骤分组：把流顺序压平，连续同 stepIndex 的卡归为一步。显示的
+  // 「第 X 步」用步组在序列中的序号（stepIndex 只是分组键、允许
+  // 空缺，序号永远连续）。
   type FlowEntry = { mod: CanvasModule; group: FlowGroup; idx: number };
   const flowSeq: FlowEntry[] = flowGroups.flatMap((g) =>
     g.modules.map((m, idx) => ({ mod: m, group: g, idx })),
@@ -3217,7 +3283,55 @@ function CanvasView({
       });
     });
   });
-  const maxStepIndex = modules.reduce((mx, m) => Math.max(mx, m.stepIndex), 0);
+  // 纵向流路线树：按 parentId 递归成树，渲染与挂接选卡共用
+  const canvasTree = buildCanvasTree(modules);
+  const treeNodeById = new Map<number, CanvasTreeNode>();
+  const collectTreeNodes = (nodes: CanvasTreeNode[]) => {
+    for (const n of nodes) {
+      treeNodeById.set(n.mod.id, n);
+      collectTreeNodes(n.children);
+    }
+  };
+  collectTreeNodes(canvasTree);
+  // 支线折叠状态：按「城市+项目」存 localStorage，重开保持
+  const collapsedStorageKey = curProjectId
+    ? `canvas-collapsed:${city}:${curProjectId}`
+    : "";
+  const [collapsedIds, setCollapsedIds] = useState<ReadonlySet<number>>(
+    new Set(),
+  );
+  useEffect(() => {
+    if (!collapsedStorageKey) return;
+    try {
+      const raw = window.localStorage.getItem(collapsedStorageKey);
+      const arr: unknown = raw ? JSON.parse(raw) : [];
+      setCollapsedIds(
+        new Set(
+          Array.isArray(arr)
+            ? arr.filter((x): x is number => typeof x === "number")
+            : [],
+        ),
+      );
+    } catch {
+      setCollapsedIds(new Set());
+    }
+  }, [collapsedStorageKey]);
+  const toggleCollapsed = (id: number) => {
+    setCollapsedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      try {
+        window.localStorage.setItem(
+          collapsedStorageKey,
+          JSON.stringify([...next]),
+        );
+      } catch {
+        // 存不下不影响本次折叠
+      }
+      return next;
+    });
+  };
   // 停止状态的到站模块不进快照、不发起任何查询；空白卡（线路/站名
   // 还没填）也没有可查的键，一样不进快照
   const stationMods = modules.filter(
@@ -3264,25 +3378,9 @@ function CanvasView({
         projectId: curProjectId > 0 ? curProjectId : undefined,
       }),
     onSuccess: (data) => {
-      const prevModules = modulesRef.current;
-      const prevLinks = linksRef.current;
+      // 新卡默认顶层（parentId 为空）：纵向流里排在主线最后，
+      // 用户事后在卡片「更多」里挂接到某张卡后面成分支路线。
       applyCanvas(data);
-      // 纵向流里加模块：新卡自动接到当前最后一条链的链尾，
-      // 流里立刻排在链的最后；没有链时就作独立卡排最后。
-      if (canvasModeRef.current === "flow") {
-        const prevIds = new Set(prevModules.map((m) => m.id));
-        const fresh = data.modules.filter((m) => !prevIds.has(m.id));
-        if (fresh.length === 1 && fresh[0]) {
-          const chains = buildFlowGroups(prevModules, prevLinks).filter(
-            (g) => g.chain,
-          );
-          const lastChain = chains[chains.length - 1];
-          const tail = lastChain?.modules[lastChain.modules.length - 1];
-          if (tail && tail.id !== fresh[0].id) {
-            addLinkMut.mutate({ fromId: tail.id, toId: fresh[0].id });
-          }
-        }
-      }
     },
   });
   const updateModuleMut = useMutation({
@@ -3334,102 +3432,30 @@ function CanvasView({
     onSuccess: applyCanvas,
   });
 
-  // 纵向流调序：与相邻卡换位后，按新顺序改写这条链的连线——
-  // 先删旧的链路连线，再按新顺序逐段连回来，链仍是一条链；
-  // 存的是连线本身，自由画布的模块坐标完全不动。
-  // 跨步调序的规整规则：若换位的两张卡步号不同，两卡同时互换步号
-  // ——卡换位置、步号留原位，于是流顺序里的步号保持不倒挂、每步的
-  // 卡数不变；同一步内换位步号不动。
-  const reorderMut = useMutation({
-    mutationFn: async (args: { group: FlowGroup; from: number; to: number }) => {
-      const arr = [...args.group.modules];
-      const [mv] = arr.splice(args.from, 1);
-      if (!mv) return null;
-      arr.splice(args.to, 0, mv);
-      const pid = curProjectId > 0 ? curProjectId : undefined;
-      for (const id of args.group.pathLinkIds) {
-        await api.removeCanvasLink({ id, city, projectId: pid });
+  // 路线树挂接：把卡挂到某张卡后面（成为它的子卡/分支路线）或移
+  // 到顶层。服务端校验同项目与防环，失败原因经 attachError 显示在
+  // 选卡列表里，不静默失败。attachForId 是正在选父卡的那张卡。
+  const [attachForId, setAttachForId] = useState<number | null>(null);
+  const [attachError, setAttachError] = useState("");
+  const setParentMut = useMutation({
+    mutationFn: (args: { id: number; parentId: number }) =>
+      api.setCanvasModuleParent({
+        ...args,
+        city,
+        projectId: curProjectId > 0 ? curProjectId : undefined,
+      }),
+    onSuccess: (res) => {
+      if (res.ok && res.canvas) {
+        applyCanvas(res.canvas);
+        setAttachForId(null);
+        setAttachError("");
+      } else {
+        if (res.canvas) applyCanvas(res.canvas);
+        setAttachError(res.error || "挂接失败，再试一次");
       }
-      let data: CanvasData | null = null;
-      for (let i = 0; i < arr.length - 1; i++) {
-        const a = arr[i];
-        const b = arr[i + 1];
-        if (!a || !b) continue;
-        data = await api.addCanvasLink({
-          fromId: a.id,
-          toId: b.id,
-          city,
-          projectId: pid,
-        });
-      }
-      const other = args.group.modules[args.to];
-      if (other && other.id !== mv.id && other.stepIndex !== mv.stepIndex) {
-        data = await api.updateCanvasModule({
-          id: mv.id,
-          stepIndex: other.stepIndex,
-          city,
-          projectId: pid,
-        });
-        data = await api.updateCanvasModule({
-          id: other.id,
-          stepIndex: mv.stepIndex,
-          city,
-          projectId: pid,
-        });
-      }
-      return data;
     },
-    onSuccess: (data) => {
-      if (data) applyCanvas(data);
-    },
+    onError: () => setAttachError("挂接失败，再试一次"),
   });
-
-  // 改步：一批 {id, stepIndex} 依次落库，最后一份全量回填。
-  // - 并入上一步：单卡改成上一张卡的步号。
-  // - 独立成下一步：本卡先改到「本步步号+1」，其后各步再依次 +1
-  //   让位——按这个顺序写，中间状态不会把别的步误并进来。
-  // - 步进器 −/+：单卡步号 ±1，与相邻步同号即并入那一步。
-  const setStepMut = useMutation({
-    mutationFn: async (changes: { id: number; stepIndex: number }[]) => {
-      const pid = curProjectId > 0 ? curProjectId : undefined;
-      let data: CanvasData | null = null;
-      for (const c of changes) {
-        data = await api.updateCanvasModule({
-          id: c.id,
-          stepIndex: c.stepIndex,
-          city,
-          projectId: pid,
-        });
-      }
-      return data;
-    },
-    onSuccess: (data) => {
-      if (data) applyCanvas(data);
-    },
-  });
-  const stepBusy = setStepMut.isPending || updateModuleMut.isPending;
-  // 与上一张同一步：上一张卡存在且步号不同才可并
-  const mergeWithPrev = (seqIdx: number) => {
-    const cur = flowSeq[seqIdx];
-    const prev = flowSeq[seqIdx - 1];
-    if (!cur || !prev || prev.mod.stepIndex === cur.mod.stepIndex) return;
-    setStepMut.mutate([{ id: cur.mod.id, stepIndex: prev.mod.stepIndex }]);
-  };
-  // 独立成下一步：本卡所在的步组多于一张卡时，把本卡拆成紧随其后
-  // 的新一步，其后各步依次 +1 让位
-  const splitToOwnStep = (entry: FlowEntry) => {
-    const s = entry.mod.stepIndex;
-    const changes: { id: number; stepIndex: number }[] = [
-      { id: entry.mod.id, stepIndex: s + 1 },
-    ];
-    const later = flowSeq.filter(
-      (e) => e.mod.stepIndex > s && e.mod.id !== entry.mod.id,
-    );
-    for (const e of later) {
-      changes.push({ id: e.mod.id, stepIndex: e.mod.stepIndex + 1 });
-    }
-    setStepMut.mutate(changes);
-  };
 
   // 项目操作：新建（空白画布起步、建好自动切过去）、改名、删除
   // （确认一次，连带删该项目的模块与连线；模块库不受影响）。
@@ -3484,6 +3510,8 @@ function CanvasView({
     if (id === curProjectId) return;
     setLinkMode(false);
     setLinkFrom(null);
+    setAttachForId(null);
+    setAttachError("");
     setProjectId(id);
     try {
       window.localStorage.setItem(projectStorageKey, String(id));
@@ -3793,7 +3821,7 @@ function CanvasView({
   // 整删确认：点卡片「更多」里的「删除」后先在模块顶部亮出确认条，确认才删
   const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null);
   // 卡片「更多」展开区：同一时间只开一张卡（两种模式共用一个状态），
-  // 调序/改步/存库/删除/备注都收在这里，卡面只留核心信息与一行操作
+  // 存库/删除/备注/挂接都收在这里，卡面只留核心信息与一行操作
   const [moreCardId, setMoreCardId] = useState<number | null>(null);
 
   // 加模块面板
@@ -3906,6 +3934,271 @@ function CanvasView({
   };
 
   const modById = (id: number) => modules.find((m) => m.id === id);
+
+  // ---- 纵向流（路线树）渲染：卡片本体与自由画布共用同一组件，
+  // 这里只负责树的结构（缩进/分支线/或/折叠）与挂接工具 ----
+  const renderFlowCard = (m: CanvasModule, tools: ReactNode): ReactNode => {
+    const stopped = m.kind === "station" && !m.enabled;
+    const modLabel =
+      m.kind === "station" ? `${m.line} ${m.station}` : `文本卡 ${m.text}`;
+    const toggleMore = () => {
+      if (attachForId !== null && attachForId !== m.id) {
+        setAttachForId(null);
+        setAttachError("");
+      }
+      setMoreCardId(moreCardId === m.id ? null : m.id);
+    };
+    return (
+      <div
+        className={`relative border bg-[var(--surface)] px-3.5 py-3 shadow-sm [border-radius:var(--radius)] ${
+          stopped ? "opacity-75 saturate-50" : ""
+        } border-[var(--border)]`}
+      >
+        {/* 整删入口已收进卡片「更多」展开区（点删除后仍先出确认条） */}
+        {confirmDeleteId === m.id && (
+          <div className="absolute inset-x-2 top-2 z-30 border border-[var(--danger)] bg-[var(--surface)] px-3 py-2.5 shadow [border-radius:8px]">
+            <p className="text-sm text-[var(--text)]">
+              删除这个模块？连着它的线也会一起删，挂在它下面的卡会改挂到它的上一级。
+            </p>
+            <div className="mt-2 flex gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setConfirmDeleteId(null);
+                  removeModuleMut.mutate(m.id);
+                }}
+                aria-label={`确认删除模块 ${modLabel}`}
+                className="min-h-11 flex-1 border border-[var(--danger)] bg-[var(--surface)] px-2 text-sm font-bold text-[var(--danger)] [border-radius:8px]"
+              >
+                删除
+              </button>
+              <button
+                type="button"
+                onClick={() => setConfirmDeleteId(null)}
+                className="min-h-11 flex-1 bg-[var(--surface2)] px-2 text-sm font-medium text-[var(--text)] [border-radius:8px]"
+              >
+                取消
+              </button>
+            </div>
+          </div>
+        )}
+        {m.kind === "station" ? (
+          <CanvasStationCard
+            mod={m}
+            city={city}
+            entry={entryOf(m.id)}
+            onSaveTemplate={() => saveTemplateMut.mutate(m)}
+            saveTemplatePending={saveTemplateMut.isPending}
+            onSaveNote={(note) => updateModuleMut.mutate({ id: m.id, note })}
+            onSaveStation={(station) =>
+              updateModuleMut.mutate({ id: m.id, station })
+            }
+            onSaveLine={(line) =>
+              updateModuleMut.mutate({
+                id: m.id,
+                line,
+                direction: 0,
+                terminal: "",
+              })
+            }
+            onToggleEnabled={(enabled) =>
+              updateModuleMut.mutate({ id: m.id, enabled })
+            }
+            onSetDirection={(direction, terminal) =>
+              updateModuleMut.mutate({ id: m.id, direction, terminal })
+            }
+            moreOpen={moreCardId === m.id}
+            onToggleMore={toggleMore}
+            onDeleteRequest={() => setConfirmDeleteId(m.id)}
+            flowTools={tools}
+          />
+        ) : (
+          <CanvasTextCard
+            mod={m}
+            onSaveTemplate={() => saveTemplateMut.mutate(m)}
+            saveTemplatePending={saveTemplateMut.isPending}
+            onSaveText={(text) => updateModuleMut.mutate({ id: m.id, text })}
+            moreOpen={moreCardId === m.id}
+            onToggleMore={toggleMore}
+            onDeleteRequest={() => setConfirmDeleteId(m.id)}
+            flowTools={tools}
+          />
+        )}
+      </div>
+    );
+  };
+
+  // 每卡「更多」里的路线树工具：挂到某张卡后面（选父卡）/ 移到顶层。
+  // 选父卡时列出项目内其他卡，自己与自己的子孙不列（防环，服务端
+  // 还会再校验一次）。
+  const renderTreeTools = (node: CanvasTreeNode): ReactNode => {
+    const m = node.mod;
+    const label = canvasModLabel(m);
+    const parentMod =
+      m.parentId > 0 ? modules.find((x) => x.id === m.parentId) : undefined;
+    if (attachForId === m.id) {
+      const descIds = treeDescendantIds(node);
+      const candidates = modules.filter(
+        (x) => x.id !== m.id && !descIds.has(x.id),
+      );
+      return (
+        <div className="mt-2 border-t border-[var(--border)] pt-2">
+          <p className="text-sm font-bold text-[var(--text)]">
+            把「{label}」挂到哪张卡后面？
+          </p>
+          <div className="mt-1.5 flex flex-col gap-1.5">
+            {candidates.map((c) => (
+              <button
+                key={c.id}
+                type="button"
+                disabled={setParentMut.isPending}
+                onClick={() =>
+                  setParentMut.mutate({ id: m.id, parentId: c.id })
+                }
+                aria-label={`把 ${label} 挂到 ${canvasModLabel(c)} 后面`}
+                className="min-h-11 bg-[var(--surface2)] px-3 text-left text-base font-medium text-[var(--text)] [border-radius:8px] disabled:opacity-50"
+              >
+                {canvasModLabel(c)}
+                {c.id === m.parentId && (
+                  <span className="text-[var(--accent)]">
+                    （现在就挂在这张后面）
+                  </span>
+                )}
+              </button>
+            ))}
+            {candidates.length === 0 && (
+              <p className="text-sm text-[var(--dim)]">
+                没有别的卡可以挂了。
+              </p>
+            )}
+          </div>
+          {attachError && (
+            <p className="mt-1.5 text-sm text-[var(--danger)]" role="alert">
+              {attachError}
+            </p>
+          )}
+          <button
+            type="button"
+            onClick={() => {
+              setAttachForId(null);
+              setAttachError("");
+            }}
+            className="mt-1.5 min-h-10 px-3 text-sm font-bold text-[var(--dim)] [border-radius:8px]"
+          >
+            取消
+          </button>
+        </div>
+      );
+    }
+    return (
+      <div className="mt-2 border-t border-[var(--border)] pt-2">
+        <div className="flex flex-wrap gap-1.5">
+          <button
+            type="button"
+            onClick={() => {
+              setAttachForId(m.id);
+              setAttachError("");
+            }}
+            aria-label={`把 ${label} 挂到某张卡后面`}
+            className="min-h-10 flex-1 bg-[var(--surface2)] px-3 text-sm font-bold whitespace-nowrap text-[var(--text)] [border-radius:8px]"
+          >
+            挂到某张卡后面
+          </button>
+          {m.parentId > 0 && (
+            <button
+              type="button"
+              disabled={setParentMut.isPending}
+              onClick={() => setParentMut.mutate({ id: m.id, parentId: 0 })}
+              aria-label={`把 ${label} 移到顶层`}
+              className="min-h-10 flex-1 bg-[var(--surface2)] px-3 text-sm font-bold whitespace-nowrap text-[var(--text)] [border-radius:8px] disabled:opacity-50"
+            >
+              移到顶层
+            </button>
+          )}
+        </div>
+        <p className="mt-1 text-xs text-[var(--dim)]">
+          {parentMod
+            ? `现在挂在「${canvasModLabel(parentMod)}」后面`
+            : "现在在顶层（主线）"}
+          {node.children.length > 0
+            ? ` · 下面挂着 ${node.children.length} 张子卡`
+            : ""}
+        </p>
+      </div>
+    );
+  };
+
+  // 递归渲染一个树节点：卡片 + 它的子卡块。子卡块相对父卡缩进、
+  // 左侧一条虚线分支线相连；同父子卡之间以「或」分隔（备选路线）；
+  // 折叠时整棵子树收成一行摘要按钮。
+  const renderTreeNode = (node: CanvasTreeNode): ReactNode => {
+    const m = node.mod;
+    const kids = node.children;
+    const label = canvasModLabel(m);
+    const collapsed = collapsedIds.has(m.id);
+    const descCount = treeDescendantCount(node);
+    const first = kids[0]?.mod;
+    const firstShort = first
+      ? first.kind === "station"
+        ? first.line.trim() || first.station.trim() || "到站卡"
+        : first.text.trim() || "文本卡"
+      : "";
+    return (
+      <div key={m.id}>
+        {renderFlowCard(m, renderTreeTools(node))}
+        {kids.length > 0 &&
+          (collapsed ? (
+            <button
+              type="button"
+              onClick={() => toggleCollapsed(m.id)}
+              aria-label={`展开 ${label} 后面折叠的 ${descCount} 张卡`}
+              className="mt-1.5 ml-5 flex min-h-11 w-[calc(100%-1.25rem)] items-center gap-2 border border-dashed border-[var(--border)] bg-[var(--surface2)] px-3 text-left text-sm font-bold text-[var(--accent)] [border-radius:8px]"
+            >
+              <span aria-hidden="true">▸</span>
+              <span className="min-w-0 truncate">
+                {firstShort} · 后面还有 {descCount} 张卡
+              </span>
+            </button>
+          ) : (
+            <>
+              <div className="mt-1 ml-5 flex items-center gap-2">
+                <span className="min-w-0 flex-1 truncate text-sm font-medium text-[var(--dim)]">
+                  ↳{" "}
+                  {kids.length > 1
+                    ? `从这里分出 ${kids.length} 条路线，任选其一`
+                    : "接着往下"}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => toggleCollapsed(m.id)}
+                  aria-label={`收起 ${label} 后面的 ${descCount} 张卡`}
+                  className="min-h-10 shrink-0 bg-[var(--surface2)] px-3 text-sm font-bold text-[var(--text)] [border-radius:8px]"
+                >
+                  收起 ▴
+                </button>
+              </div>
+              <div className="ml-5 border-l-[3px] border-dashed border-[var(--accent)] pl-3">
+                {kids.map((child, ci) => (
+                  <div key={child.mod.id} className="pt-2">
+                    {ci > 0 && (
+                      <div
+                        className="flex items-center justify-center pb-2"
+                        aria-hidden="true"
+                      >
+                        <span className="border border-[var(--amber)] bg-[var(--amber-bg)] px-3 py-0.5 text-sm font-black text-[var(--amber)] [border-radius:999px]">
+                          或
+                        </span>
+                      </div>
+                    )}
+                    {renderTreeNode(child)}
+                  </div>
+                ))}
+              </div>
+            </>
+          ))}
+      </div>
+    );
+  };
 
   return (
     <section
@@ -4784,7 +5077,7 @@ function CanvasView({
       {canvasQ.data && canvasMode === "flow" && (
         <div
           className="mt-2 min-h-0 flex-1 overflow-y-auto"
-          aria-label={`${city}到站纵向流：按连线顺序从上往下排列的大卡`}
+          aria-label={`${city}到站纵向流：按路线树从上往下排列的大卡，子卡是父卡分出的不同路线`}
         >
           {templateFlash && (
             <p className="mb-2 px-1 text-sm font-medium text-[var(--accent)]" role="status">
@@ -4796,9 +5089,9 @@ function CanvasView({
               还没有模块。点上面「＋ 加模块」放一张空白到站卡，或从模块库调用、从规划转进来，第一张卡就会出现在这里。
             </p>
           )}
-          {stepGroups.map((sg, gi) => (
-            <div key={`s${sg.step}-${sg.entries[0]?.mod.id ?? 0}`}>
-              {gi > 0 && (
+          {canvasTree.map((node, i) => (
+            <div key={node.mod.id}>
+              {i > 0 && (
                 <div
                   className="flex flex-col items-center py-1.5"
                   aria-hidden="true"
@@ -4809,215 +5102,7 @@ function CanvasView({
                   </span>
                 </div>
               )}
-              <div className="flex items-baseline gap-2 px-1 pt-1 pb-2">
-                <span className="text-lg font-black text-[var(--text)]">
-                  第 {gi + 1} 步
-                </span>
-                {sg.entries.length > 1 && (
-                  <span className="text-sm font-medium text-[var(--amber)]">
-                    · {sg.entries.length} 个方案，任选其一
-                  </span>
-                )}
-              </div>
-              {sg.entries.map((e, ei) => {
-                const m = e.mod;
-                const g = e.group;
-                const idx = e.idx;
-                const seqIdx = flowSeq.indexOf(e);
-                const prevEntry = seqIdx > 0 ? flowSeq[seqIdx - 1] : undefined;
-                const canMerge =
-                  !!prevEntry && prevEntry.mod.stepIndex !== m.stepIndex;
-                const stopped = m.kind === "station" && !m.enabled;
-                const modLabel =
-                  m.kind === "station" ? `${m.line} ${m.station}` : `文本卡 ${m.text}`;
-                // 流模式的调序/改步控件：不再常驻卡面，收进卡片「更多」
-                // 展开区（flowTools 传入卡片组件，点开才显示）
-                const flowTools = (
-                  <>
-                    {g.chain && g.modules.length > 1 && (
-                      <div className="mt-2 flex items-center gap-2">
-                        <button
-                          type="button"
-                          disabled={idx === 0 || reorderMut.isPending}
-                          onClick={() =>
-                            reorderMut.mutate({ group: g, from: idx, to: idx - 1 })
-                          }
-                          aria-label={`把模块 ${modLabel} 上移一位`}
-                          className="min-h-10 flex-1 bg-[var(--surface2)] px-3 text-base font-bold text-[var(--text)] [border-radius:8px] disabled:opacity-40"
-                        >
-                          ↑ 上移
-                        </button>
-                        <span className="shrink-0 text-sm text-[var(--dim)]">
-                          {idx + 1} / {g.modules.length}
-                        </span>
-                        <button
-                          type="button"
-                          disabled={idx === g.modules.length - 1 || reorderMut.isPending}
-                          onClick={() =>
-                            reorderMut.mutate({ group: g, from: idx, to: idx + 1 })
-                          }
-                          aria-label={`把模块 ${modLabel} 下移一位`}
-                          className="min-h-10 flex-1 bg-[var(--surface2)] px-3 text-base font-bold text-[var(--text)] [border-radius:8px] disabled:opacity-40"
-                        >
-                          ↓ 下移
-                        </button>
-                      </div>
-                    )}
-                    <div className="mt-2 flex flex-wrap items-center gap-2 border-t border-[var(--border)] pt-2">
-                      <span className="flex items-center gap-1.5">
-                        <button
-                          type="button"
-                          disabled={stepBusy || m.stepIndex <= 1}
-                          onClick={() =>
-                            setStepMut.mutate([
-                              { id: m.id, stepIndex: m.stepIndex - 1 },
-                            ])
-                          }
-                          aria-label={`把模块 ${modLabel} 的步号减一`}
-                          className="flex min-h-10 min-w-10 items-center justify-center bg-[var(--surface2)] px-2 text-lg font-black text-[var(--text)] [border-radius:8px] disabled:opacity-40"
-                        >
-                          −
-                        </button>
-                        <span className="px-0.5 text-base font-bold whitespace-nowrap text-[var(--text)]">
-                          第 {gi + 1} 步
-                        </span>
-                        <button
-                          type="button"
-                          disabled={
-                            stepBusy ||
-                            (m.stepIndex >= maxStepIndex && sg.entries.length === 1)
-                          }
-                          onClick={() =>
-                            setStepMut.mutate([
-                              { id: m.id, stepIndex: m.stepIndex + 1 },
-                            ])
-                          }
-                          aria-label={`把模块 ${modLabel} 的步号加一`}
-                          className="flex min-h-10 min-w-10 items-center justify-center bg-[var(--surface2)] px-2 text-lg font-black text-[var(--text)] [border-radius:8px] disabled:opacity-40"
-                        >
-                          +
-                        </button>
-                      </span>
-                      {canMerge && (
-                        <button
-                          type="button"
-                          disabled={stepBusy}
-                          onClick={() => mergeWithPrev(seqIdx)}
-                          aria-label={`把模块 ${modLabel} 并入上一步作为备选方案`}
-                          className="min-h-10 flex-1 bg-[var(--surface2)] px-3 text-sm font-bold whitespace-nowrap text-[var(--text)] [border-radius:8px] disabled:opacity-40"
-                        >
-                          与上一张同一步
-                        </button>
-                      )}
-                      {sg.entries.length > 1 && (
-                        <button
-                          type="button"
-                          disabled={stepBusy}
-                          onClick={() => splitToOwnStep(e)}
-                          aria-label={`把模块 ${modLabel} 拆出来独立成下一步`}
-                          className="min-h-10 flex-1 bg-[var(--surface2)] px-3 text-sm font-bold whitespace-nowrap text-[var(--text)] [border-radius:8px] disabled:opacity-40"
-                        >
-                          独立成下一步
-                        </button>
-                      )}
-                    </div>
-                  </>
-                );
-                return (
-                  <div key={m.id}>
-                    {ei > 0 && (
-                      <div
-                        className="flex items-center justify-center py-1.5"
-                        aria-hidden="true"
-                      >
-                        <span className="border border-[var(--amber)] bg-[var(--amber-bg)] px-3 py-0.5 text-sm font-black text-[var(--amber)] [border-radius:999px]">
-                          或
-                        </span>
-                      </div>
-                    )}
-                    <div
-                      className={`relative border bg-[var(--surface)] px-3.5 py-3 shadow-sm [border-radius:var(--radius)] ${
-                        stopped ? "opacity-75 saturate-50" : ""
-                      } border-[var(--border)]`}
-                    >
-                      {/* 整删入口已收进卡片「更多」展开区（点删除后仍先出确认条） */}
-                      {confirmDeleteId === m.id && (
-                        <div className="absolute inset-x-2 top-2 z-30 border border-[var(--danger)] bg-[var(--surface)] px-3 py-2.5 shadow [border-radius:8px]">
-                          <p className="text-sm text-[var(--text)]">
-                            删除这个模块？连着它的线也会一起删。
-                          </p>
-                          <div className="mt-2 flex gap-2">
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setConfirmDeleteId(null);
-                                removeModuleMut.mutate(m.id);
-                              }}
-                              aria-label={`确认删除模块 ${modLabel}`}
-                              className="min-h-11 flex-1 border border-[var(--danger)] bg-[var(--surface)] px-2 text-sm font-bold text-[var(--danger)] [border-radius:8px]"
-                            >
-                              删除
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => setConfirmDeleteId(null)}
-                              className="min-h-11 flex-1 bg-[var(--surface2)] px-2 text-sm font-medium text-[var(--text)] [border-radius:8px]"
-                            >
-                              取消
-                            </button>
-                          </div>
-                        </div>
-                      )}
-                      {m.kind === "station" ? (
-                        <CanvasStationCard
-                          mod={m}
-                          city={city}
-                          entry={entryOf(m.id)}
-                          onSaveTemplate={() => saveTemplateMut.mutate(m)}
-                          saveTemplatePending={saveTemplateMut.isPending}
-                          onSaveNote={(note) => updateModuleMut.mutate({ id: m.id, note })}
-                          onSaveStation={(station) =>
-                            updateModuleMut.mutate({ id: m.id, station })
-                          }
-                          onSaveLine={(line) =>
-                            updateModuleMut.mutate({
-                              id: m.id,
-                              line,
-                              direction: 0,
-                              terminal: "",
-                            })
-                          }
-                          onToggleEnabled={(enabled) =>
-                            updateModuleMut.mutate({ id: m.id, enabled })
-                          }
-                          onSetDirection={(direction, terminal) =>
-                            updateModuleMut.mutate({ id: m.id, direction, terminal })
-                          }
-                          moreOpen={moreCardId === m.id}
-                          onToggleMore={() =>
-                            setMoreCardId(moreCardId === m.id ? null : m.id)
-                          }
-                          onDeleteRequest={() => setConfirmDeleteId(m.id)}
-                          flowTools={flowTools}
-                        />
-                      ) : (
-                        <CanvasTextCard
-                          mod={m}
-                          onSaveTemplate={() => saveTemplateMut.mutate(m)}
-                          saveTemplatePending={saveTemplateMut.isPending}
-                          onSaveText={(text) => updateModuleMut.mutate({ id: m.id, text })}
-                          moreOpen={moreCardId === m.id}
-                          onToggleMore={() =>
-                            setMoreCardId(moreCardId === m.id ? null : m.id)
-                          }
-                          onDeleteRequest={() => setConfirmDeleteId(m.id)}
-                          flowTools={flowTools}
-                        />
-                      )}
-                    </div>
-                  </div>
-                );
-              })}
+              {renderTreeNode(node)}
             </div>
           ))}
         </div>
@@ -5028,7 +5113,7 @@ function CanvasView({
           操作说明（点开看）
         </summary>
         <p className="pb-1 text-xs leading-relaxed text-[var(--dim)]">
-          两种看法：自由画布自由拖动摆布，拖模块本体移动它（点中或拖动的模块会自动翻到最前），拖空白处平移画布，双指或滚轮缩放；纵向流按步从上往下全宽排开——同一步多卡是备选（或），步间是先后（向下的大箭头），卡上的 ↑↓ 换位会把连线顺序一并改好，切回自由画布时模块位置不变。卡面只留核心信息（站名/线路/方向/第 1 班/第 2 班/数据时间）和一行操作（开始/停止、点查、更多）；调序、改步、存库、删除、备注都收在卡片的「更多」里，点开才显示，一次只开一张。步骤：行程按「第 X 步」分组，同一步里的多张卡是备选方案（中间标「或」，任选其一）；在「更多」里能改步——「与上一张同一步」把卡并入上一步当备选、「独立成下一步」把卡拆出来自己一步，也能用 −/+ 直接改步号（与相邻步同号即并入那一步）；↑↓ 跨步换位时两张卡互换步号，步的分组大小不变。自由画布里每张卡左上角有步号徽章，同一步多卡标方案A/B/C。连线：按住模块右侧的蓝点拖到另一个模块上松手（虚线带箭头，按顺序连就是行程顺序）；整删在卡片「更多」里点「删除」（会先确认一次）。到站卡可开始/停止：停止后变灰待机、不查车。打开画布不自动查车：有缓存先看缓存，每张到站卡点刷新只查它自己。到站卡前三行（站名/线路/方向）点一下先出可选项点选——方向行点 ◀ ▶ 直接在两个终点站之间切换、点方向文字出终点站二选一，站名从站序里挑、线路从你用过的里面挑，实在没有选项才打字，选完自动保存；「＋ 加模块」里可以直接放一张空白卡，不用先查线路。配好的模块点卡片「更多」里的「存库」存入模块库，之后在「＋ 加模块 → 我的模块库」点一下就放一份副本到画布上，副本和模板互不影响。页头点项目名可以切换项目，「⋯」菜单里新建、改名、删除项目。项目里的模块、连线、位置改完即存，切走再回来原样恢复。
+          两种看法：自由画布自由拖动摆布，拖模块本体移动它（点中或拖动的模块会自动翻到最前），拖空白处平移画布，双指或滚轮缩放；纵向流是路线树，像二叉树一样分叉：顶层卡自上而下是主线（卡间向下的大箭头是「然后」），一张卡下面缩进挂着的子卡是它分出的不同路线，同父的子卡之间标「或」任选其一，子卡下面还能再挂子卡、继续往下分。带子卡的卡能点「收起」把整条支线折成一行摘要，点摘要重新展开，收起状态会记住。卡面只留核心信息（站名/线路/方向/第 1 班/第 2 班/数据时间）和一行操作（开始/停止、点查、更多）；存库、删除、备注、挂接都收在卡片的「更多」里，点开才显示，一次只开一张。挂接：在「更多」里点「挂到某张卡后面」再点选一张卡，这张卡就成为它的子卡（分支路线）；「移到顶层」解除挂接回到主线；不能挂到自己或自己的子卡下面（会绕成圈）。新加的卡默认在顶层主线，摆好后在「更多」里挂接。自由画布里每张卡左上角有步号徽章（旧的步骤编号，同一步多卡标方案A/B/C）。连线（自由画布）：按住模块右侧的蓝点拖到另一个模块上松手（虚线带箭头）；整删在卡片「更多」里点「删除」（会先确认一次；删掉一张卡，它的子卡会自动改挂到它的上一级）。到站卡可开始/停止：停止后变灰待机、不查车。打开画布不自动查车：有缓存先看缓存，每张到站卡点刷新只查它自己。到站卡前三行（站名/线路/方向）点一下先出可选项点选——方向行点 ◀ ▶ 直接在两个终点站之间切换、点方向文字出终点站二选一，站名从站序里挑、线路从你用过的里面挑，实在没有选项才打字，选完自动保存；「＋ 加模块」里可以直接放一张空白卡，不用先查线路。配好的模块点卡片「更多」里的「存库」存入模块库，之后在「＋ 加模块 → 我的模块库」点一下就放一份副本到画布上，副本和模板互不影响。页头点项目名可以切换项目，「⋯」菜单里新建、改名、删除项目。项目里的模块、连线、位置改完即存，切走再回来原样恢复。
         </p>
       </details>
     </section>
@@ -5119,7 +5204,7 @@ function CanvasStationCard({
   moreOpen: boolean;
   onToggleMore: () => void;
   onDeleteRequest: () => void;
-  // 纵向流的调序/改步控件，由流渲染处传入、只在展开区里显示
+  // 纵向流的路线树工具（挂接/移到顶层），由流渲染处传入、只在展开区里显示
   flowTools?: ReactNode;
 }) {
   const stopped = !mod.enabled;
@@ -5568,7 +5653,7 @@ function CanvasStationCard({
       )}
 
       {/* 常驻操作行（一行三个，约 40px 高）：开始/停止、点查、更多。
-          调序/改步/存库/删除/备注都在「更多」展开区里，卡面不再摊开 */}
+          存库/删除/备注/挂接都在「更多」展开区里，卡面不再摊开 */}
       <div className="mt-2 flex items-center gap-1.5">
         <button
           type="button"
@@ -5603,7 +5688,7 @@ function CanvasStationCard({
           aria-label={
             moreOpen
               ? `收起 ${mod.line} 在 ${mod.station} 的更多操作`
-              : `展开 ${mod.line} 在 ${mod.station} 的更多操作（调序、改步、存库、删除、备注）`
+              : `展开 ${mod.line} 在 ${mod.station} 的更多操作（存库、删除、备注、挂接）`
           }
           className={`min-h-10 shrink-0 px-3 text-base font-bold whitespace-nowrap [border-radius:8px] ${
             moreOpen
@@ -5660,7 +5745,7 @@ function CanvasTextCard({
   onSaveTemplate: () => void;
   saveTemplatePending: boolean;
   onSaveText: (text: string) => void;
-  // 「更多」展开区：与到站卡同一套结构（存库/连线/删除 + 流模式调序改步）
+  // 「更多」展开区：与到站卡同一套结构（存库/连线/删除 + 流模式路线树工具）
   moreOpen: boolean;
   onToggleMore: () => void;
   onDeleteRequest: () => void;
@@ -5690,7 +5775,7 @@ function CanvasTextCard({
           aria-label={
             moreOpen
               ? `收起文本卡 ${mod.text} 的更多操作`
-              : `展开文本卡 ${mod.text} 的更多操作（调序、改步、存库、删除）`
+              : `展开文本卡 ${mod.text} 的更多操作（存库、删除、挂接）`
           }
           className={`min-h-10 shrink-0 px-3 text-base font-bold whitespace-nowrap [border-radius:8px] ${
             moreOpen

@@ -1033,6 +1033,8 @@ const canvasResponse = z.object({
       note: z.string(),
       enabled: z.boolean(),
       stepIndex: z.number(),
+      // 路线树挂接：本卡接在哪张卡之后（同项目模块 id），0 = 顶层
+      parentId: z.number(),
       x: z.number(),
       y: z.number(),
     }),
@@ -1276,6 +1278,7 @@ async function listCanvas(
       note: m.note,
       enabled: m.enabled !== 0,
       stepIndex: m.stepIndex,
+      parentId: m.parentId ?? 0,
       x: m.x,
       y: m.y,
     })),
@@ -2987,9 +2990,85 @@ export const Actions = {
     },
   }),
 
+  setCanvasModuleParent: defineAction({
+    description:
+      "把画布模块挂到另一张卡后面（parentId>0）或移到顶层（parentId=0）：纵向流按 parent 关系渲染成可收缩的路线树，子卡是父卡分出的不同路线。父卡必须与本卡同城市同项目；挂到自己或自己的后续卡（子孙）下面会绕成圈，被拒绝并在 error 里返回原因（canvas 仍带回当前全量供客户端同步）。返回 {ok, error, canvas}。city 缺省为厦门。",
+    request: z.object({
+      id: z.number().int().positive(),
+      parentId: z.number().int().min(0),
+      city: z.string().max(20).optional(),
+      projectId: z.number().int().positive().optional(),
+    }),
+    response: canvasProjectOpResponse,
+    async handler(
+      ctx,
+      args,
+    ): Promise<z.infer<typeof canvasProjectOpResponse>> {
+      const city = cityOf(args.city);
+      const db = ctx.db<typeof schema>();
+      const { projectId } = await resolveCanvasProject(
+        ctx,
+        city,
+        args.projectId,
+      );
+      const fail = async (
+        error: string,
+      ): Promise<z.infer<typeof canvasProjectOpResponse>> => ({
+        ok: false,
+        error,
+        canvas: await listCanvas(ctx, city, projectId),
+      });
+      const inProject = (id: number) =>
+        db
+          .select({
+            id: schema.canvasModules.id,
+            parentId: schema.canvasModules.parentId,
+          })
+          .from(schema.canvasModules)
+          .where(
+            and(
+              eq(schema.canvasModules.id, id),
+              eq(schema.canvasModules.city, city),
+              eq(schema.canvasModules.projectId, projectId),
+            ),
+          )
+          .limit(1);
+      const selfRows = await inProject(args.id);
+      if (!selfRows[0]) {
+        return fail("这张卡不存在了，可能已经被删掉");
+      }
+      if (args.parentId === args.id) {
+        return fail("不能把卡挂到它自己后面");
+      }
+      if (args.parentId > 0) {
+        const parentRows = await inProject(args.parentId);
+        if (!parentRows[0]) {
+          return fail("要挂到的卡不存在了，可能已经被删掉");
+        }
+        // 防环：从父卡沿 parent 链往上走，遇到本卡说明会绕成圈
+        let cursor: number | null = args.parentId;
+        const guard = new Set<number>();
+        while (cursor !== null && cursor > 0 && !guard.has(cursor)) {
+          if (cursor === args.id) {
+            return fail("不能挂到自己的后续卡下面，会绕成一圈");
+          }
+          guard.add(cursor);
+          const rows = await inProject(cursor);
+          cursor = rows[0]?.parentId ?? null;
+        }
+      }
+      await db
+        .update(schema.canvasModules)
+        .set({ parentId: args.parentId > 0 ? args.parentId : null })
+        .where(eq(schema.canvasModules.id, args.id));
+      const canvas = await listCanvas(ctx, city, projectId);
+      return { ok: true, error: "", canvas };
+    },
+  }),
+
   removeCanvasModule: defineAction({
     description:
-      "删除一个画布模块，并一并删掉与它相连的全部连线。返回该城市画布全量。city 缺省为厦门。",
+      "删除一个画布模块，并一并删掉与它相连的全部连线；挂在它下面的子卡自动改挂到它的父卡名下（父卡也没有就回到顶层），路线树不断裂。返回该城市画布全量。city 缺省为厦门。",
     request: z.object({
       id: z.number().int().positive(),
       city: z.string().max(20).optional(),
@@ -2999,6 +3078,16 @@ export const Actions = {
     async handler(ctx, args): Promise<z.infer<typeof canvasResponse>> {
       const city = cityOf(args.city);
       const db = ctx.db<typeof schema>();
+      // 子卡改挂：删卡前先把它的子卡过继给它的父卡（无父卡则顶层）
+      const selfRows = await db
+        .select({ parentId: schema.canvasModules.parentId })
+        .from(schema.canvasModules)
+        .where(eq(schema.canvasModules.id, args.id))
+        .limit(1);
+      await db
+        .update(schema.canvasModules)
+        .set({ parentId: selfRows[0]?.parentId ?? null })
+        .where(eq(schema.canvasModules.parentId, args.id));
       await db
         .delete(schema.canvasLinks)
         .where(

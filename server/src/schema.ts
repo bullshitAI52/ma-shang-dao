@@ -100,10 +100,19 @@ export const canvasProjects = sqliteTable("canvas_projects", {
 // （或，任选其一），步与步之间是先后（然后）。0 = 尚未编号，服务端
 // 在 listCanvas 里按纵向流顺序一次性编号（一卡一步）后回写，之后
 // 恒 ≥1；编号只作分组键、允许空缺，「第 X 步」由前端按分组顺序算。
+// 路线树升级后 stepIndex 只供自由画布的步号徽章与纵向流同层排序，
+// 不再驱动纵向流结构。
+// parentId 是路线树挂接：本卡接在哪张卡之后（同项目内的模块 id），
+// NULL = 顶层（主线）。纵向流按它递归渲染成可收缩的路线树：子卡是
+// 父卡分出的不同路线、同父子卡之间是备选（或）。存量数据由迁移
+// 0014 按 stepIndex 推导（第 1 步顶层；某步只有 1 张卡时下一步全挂
+// 到它名下；上一步多卡时下一步暂置顶层由用户手动挂）。新卡默认
+// NULL（顶层），用户在卡片「更多」里挂接/移到顶层（服务端防环）。
 export const canvasModules = sqliteTable("canvas_modules", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   city: text("city").notNull().default("厦门"),
   projectId: integer("project_id").notNull().default(0),
+  parentId: integer("parent_id"),
   stepIndex: integer("step_index").notNull().default(0),
   kind: text("kind", { enum: ["station", "text"] }).notNull(),
   line: text("line").notNull().default(""),
