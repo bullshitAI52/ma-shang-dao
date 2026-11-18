@@ -43,6 +43,13 @@
       "when": 1794962126247,
       "tag": "0006_favorite_places_and_active_trip",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1794962887158,
+      "tag": "0007_transfer_walk_times_table",
+      "breakpoints": true
     }
   ]
 }

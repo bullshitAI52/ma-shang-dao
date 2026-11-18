@@ -121,6 +121,152 @@ function SectionTitle({ children }: { children: string }) {
   return <h2 className="text-sm font-bold text-[var(--dim)]">{children}</h2>;
 }
 
+// ---------- 换乘步行时间（可手动调节） ----------
+// 默认按步行距离 ÷ 80 米/分钟估算；用户在某个换乘点调过之后，按
+// 「城市 + 换乘站名 + 接驳线路」存服务端，下次规划或行程里再遇到同一
+// 个换乘点自动套用并标注「按你的设置」，不同换乘点互不影响。规划、
+// 行程、宽裕度提示读的是同一份设置，所以行程进行中改完立即生效。
+
+type WalkSegLike = {
+  type: string;
+  name: string;
+  departure: string;
+  arrival: string;
+  walkDistance: string;
+};
+
+function walkKeyOf(station: string, nextLine: string): string {
+  return `${station.trim()}|${nextLine.trim()}`;
+}
+
+function defaultWalkMinutes(distanceMeters: number): number {
+  if (!Number.isFinite(distanceMeters) || distanceMeters <= 0) return 0;
+  return Math.min(30, Math.round(distanceMeters / 80));
+}
+
+/**
+ * 步行段 idx 对应的换乘点：接驳线路是它后面第一段乘车线路，换乘站名
+ * 取那段的上车站；后面没有乘车段（末尾步行）时站名取上一段的下车站、
+ * 接驳线路为空串。
+ */
+function walkPointOf(
+  segments: WalkSegLike[],
+  idx: number,
+): { station: string; nextLine: string } {
+  for (let j = idx + 1; j < segments.length; j++) {
+    const s = segments[j];
+    if (s && s.type !== "步行") return { station: s.departure, nextLine: s.name };
+  }
+  for (let j = idx - 1; j >= 0; j--) {
+    const s = segments[j];
+    if (s && s.type !== "步行") return { station: s.arrival, nextLine: "" };
+  }
+  return { station: "", nextLine: "" };
+}
+
+/** 乘车段 idx 是否紧接上一乘车段（中间没有步行段）：同站/过街换乘。 */
+function isDirectTransfer(segments: WalkSegLike[], idx: number): boolean {
+  if (idx <= 0) return false;
+  const prev = segments[idx - 1];
+  return !!prev && prev.type !== "步行";
+}
+
+/** 乘车段 idx 之前是否已有乘车段（即它是不是换乘接驳段）。 */
+function hasRideBefore(segments: WalkSegLike[], idx: number): boolean {
+  return segments.slice(0, idx).some((s) => s.type !== "步行");
+}
+
+function useWalkTimes(city: string) {
+  const queryClient = useQueryClient();
+  const q = useQuery({
+    queryKey: ["transferWalkTimes", city],
+    queryFn: () => api.getTransferWalkTimes({ city }),
+  });
+  const map = new Map<string, number>();
+  for (const it of q.data?.items ?? []) {
+    map.set(walkKeyOf(it.station, it.nextLine), it.minutes);
+  }
+  const mut = useMutation({
+    mutationFn: (args: { station: string; nextLine: string; minutes: number }) =>
+      api.setTransferWalkTime({ ...args, city }),
+    onSuccess: (data) =>
+      queryClient.setQueryData(["transferWalkTimes", city], data),
+  });
+  const effective = (station: string, nextLine: string, defaultMin: number) => {
+    const custom = map.get(walkKeyOf(station, nextLine));
+    return { minutes: custom ?? defaultMin, isCustom: custom !== undefined };
+  };
+  const setMinutes = (station: string, nextLine: string, minutes: number) => {
+    const st = station.trim();
+    if (!st) return;
+    mut.mutate({ station: st, nextLine: nextLine.trim(), minutes });
+  };
+  return { effective, setMinutes };
+}
+
+/** 步行分钟数调节：− / + 一分钟一档，中间可直接输入，范围 0–30 分钟。 */
+function WalkTimeControl({
+  minutes,
+  isCustom,
+  onChange,
+  label,
+}: {
+  minutes: number;
+  isCustom: boolean;
+  onChange: (m: number) => void;
+  label: string;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const clamp = (n: number) => Math.min(30, Math.max(0, Math.round(n)));
+  const commitDraft = () => {
+    if (draft === null) return;
+    const n = Number(draft);
+    if (draft.trim() !== "" && Number.isFinite(n)) onChange(clamp(n));
+    setDraft(null);
+  };
+  const btnCls =
+    "shrink-0 bg-[var(--surface2)] px-2.5 text-base font-bold text-[var(--text)] [border-radius:8px] disabled:opacity-40";
+  return (
+    <span className="inline-flex flex-wrap items-center gap-1.5">
+      <span className="text-sm text-[var(--dim)]">步行约</span>
+      <button
+        type="button"
+        aria-label={`减少${label}的步行时间`}
+        disabled={minutes <= 0}
+        onClick={() => onChange(clamp(minutes - 1))}
+        className={btnCls}
+      >
+        −
+      </button>
+      <input
+        value={draft ?? String(minutes)}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commitDraft}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            commitDraft();
+          }
+        }}
+        inputMode="numeric"
+        aria-label={`${label}的步行分钟数（0 到 30 分钟）`}
+        className="w-12 shrink-0 border border-[var(--border)] bg-[var(--surface)] px-1 py-1 text-center text-base text-[var(--text)] [border-radius:8px] outline-none focus:border-[var(--accent)]"
+      />
+      <button
+        type="button"
+        aria-label={`增加${label}的步行时间`}
+        disabled={minutes >= 30}
+        onClick={() => onChange(clamp(minutes + 1))}
+        className={btnCls}
+      >
+        +
+      </button>
+      <span className="text-sm text-[var(--dim)]">分钟</span>
+      {isCustom && <span className="text-xs text-[var(--dim)]">按你的设置</span>}
+    </span>
+  );
+}
+
 // ---------- app ----------
 
 export function App() {
@@ -338,6 +484,40 @@ export function App() {
       startTripMut.mutate({ origin: origin.trim(), destination: destination.trim(), plan });
     }
   };
+
+  // 常用路线一键开始行程：用该路线的起点+终点自动规划（走高德，不耗
+  // apizero 额度），取最优方案直接 startTrip 并跳行程视图，不再手动选
+  // 方案。已有进行中行程时不静默覆盖：先置 pendingQuickRoute 弹确认，
+  // 用户点「结束并开始新行程」才真正执行替换。
+  const [pendingQuickRoute, setPendingQuickRoute] = useState<FavRoute | null>(null);
+  const quickStartMut = useMutation({
+    mutationFn: async (r: FavRoute) => {
+      const res = await api.planRoute({ origin: r.origin, destination: r.destination, city });
+      if (!res.ok) throw new Error(res.error || "规划失败，没有可用方案");
+      const plan = res.plans.find((p) => p.best) ?? res.plans[0];
+      if (!plan) throw new Error("没有找到可用方案");
+      return api.startTrip({
+        origin: r.origin,
+        destination: r.destination,
+        city,
+        segments: plan.segments,
+      });
+    },
+    onSuccess: (data) => {
+      queryClient.setQueryData(["activeTrip"], data);
+      setTripFinished(false);
+      setPendingQuickRoute(null);
+      setTab("trip");
+    },
+  });
+  const quickStartTrip = (r: FavRoute) => {
+    quickStartMut.reset();
+    if (activeTrip) setPendingQuickRoute(r);
+    else quickStartMut.mutate(r);
+  };
+  const quickPendingId = quickStartMut.isPending
+    ? (quickStartMut.variables?.id ?? null)
+    : null;
   const advanceTripMut = useMutation({
     mutationFn: () => api.advanceTrip({}),
     onSuccess: (data) => {
@@ -536,6 +716,49 @@ export function App() {
           )}
         </header>
 
+        {/* 一键开始行程：已有进行中行程时的替换确认（不静默覆盖） */}
+        {pendingQuickRoute && (
+          <div
+            className="mt-4 border border-[var(--amber)] bg-[var(--amber-bg)] px-4 py-3 [border-radius:var(--radius)]"
+            role="alertdialog"
+            aria-label="已有进行中的行程，确认开始新行程"
+          >
+            <p className="text-sm text-[var(--text)]">
+              已有进行中的行程
+              {activeTrip && (
+                <>
+                  （{activeTrip.origin} → {activeTrip.destination}）
+                </>
+              )}
+              。开始「{pendingQuickRoute.label}」会结束当前行程。
+            </p>
+            <div className="mt-2 flex gap-2">
+              <button
+                type="button"
+                className="bg-[var(--accent)] px-4 py-1.5 text-sm font-bold text-[var(--accent-ink)] [border-radius:8px] disabled:opacity-50"
+                disabled={quickStartMut.isPending}
+                onClick={() => quickStartMut.mutate(pendingQuickRoute)}
+              >
+                {quickStartMut.isPending ? "正在开始…" : "结束并开始新行程"}
+              </button>
+              <button
+                type="button"
+                className={ghostBtnCls}
+                onClick={() => setPendingQuickRoute(null)}
+              >
+                取消
+              </button>
+            </div>
+          </div>
+        )}
+        {quickStartMut.isError && (
+          <div className="mt-4">
+            <ErrorBox
+              message={`开始行程失败：${quickStartMut.error instanceof Error ? quickStartMut.error.message : String(quickStartMut.error)}`}
+            />
+          </div>
+        )}
+
         {/* ============ 查车 ============ */}
         {tab === "home" && (
           <>
@@ -561,18 +784,14 @@ export function App() {
                 {favRouteList.length > 0 && (
                   <div className="mt-4">
                     <SectionTitle>常用路线</SectionTitle>
-                    <div className="mt-2 flex gap-2 overflow-x-auto pb-1">
-                      {favRouteList.map((r) => (
-                        <button
-                          key={r.id}
-                          type="button"
-                          className="shrink-0 border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--text)] [border-radius:999px]"
-                          aria-label={`规划常用路线 ${r.label}`}
-                          onClick={() => runRoute(r.origin, r.destination)}
-                        >
-                          {r.label}
-                        </button>
-                      ))}
+                    <div className="mt-2">
+                      <FavRouteChips
+                        routes={favRouteList}
+                        onPlan={(r) => runRoute(r.origin, r.destination)}
+                        onQuickStart={quickStartTrip}
+                        pendingId={quickPendingId}
+                        startDisabled={quickStartMut.isPending}
+                      />
                     </div>
                   </div>
                 )}
@@ -791,6 +1010,21 @@ export function App() {
               </div>
             </form>
 
+            {favRouteList.length > 0 && (
+              <div className="mt-4">
+                <SectionTitle>常用路线</SectionTitle>
+                <div className="mt-2">
+                  <FavRouteChips
+                    routes={favRouteList}
+                    onPlan={(r) => runRoute(r.origin, r.destination)}
+                    onQuickStart={quickStartTrip}
+                    pendingId={quickPendingId}
+                    startDisabled={quickStartMut.isPending}
+                  />
+                </div>
+              </div>
+            )}
+
             <div className="mt-4">
               <div className="flex flex-wrap gap-2">
                 <button
@@ -869,6 +1103,7 @@ export function App() {
             {rp.data?.ok && (
               <RoutePlansPanel
                 data={rp.data}
+                city={city}
                 onStartTrip={startTrip}
                 starting={startTripMut.isPending}
                 hasActiveTrip={!!activeTrip}
@@ -1037,6 +1272,15 @@ export function App() {
                         onClick={() => runRoute(r.origin, r.destination)}
                       >
                         {r.label}
+                      </button>
+                      <button
+                        type="button"
+                        aria-label={`按常用路线 ${r.label} 开始行程`}
+                        className="shrink-0 px-2 text-sm font-bold whitespace-nowrap text-[var(--accent)] disabled:opacity-50"
+                        disabled={quickStartMut.isPending}
+                        onClick={() => quickStartTrip(r)}
+                      >
+                        {quickPendingId === r.id ? "规划中…" : "开始行程"}
                       </button>
                       <button
                         type="button"
@@ -1703,6 +1947,48 @@ function StationArrivalsPanel({
 
 const CIRCLES = "①②③④⑤⑥⑦⑧⑨⑩";
 
+// 常用路线快捷横排（首页与规划页共用）：点路线名去规划，点「开始行程」
+// 一键按最优方案开始行程。pendingId 是正在自动规划的那条路线 id。
+function FavRouteChips({
+  routes,
+  onPlan,
+  onQuickStart,
+  pendingId,
+  startDisabled,
+}: {
+  routes: FavRoute[];
+  onPlan: (r: FavRoute) => void;
+  onQuickStart: (r: FavRoute) => void;
+  pendingId: number | null;
+  startDisabled: boolean;
+}) {
+  return (
+    <div className="flex gap-2 overflow-x-auto pb-1">
+      {routes.map((r) => (
+        <span key={r.id} className="flex shrink-0 items-center gap-1">
+          <button
+            type="button"
+            className="border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--text)] [border-radius:999px]"
+            aria-label={`规划常用路线 ${r.label}`}
+            onClick={() => onPlan(r)}
+          >
+            {r.label}
+          </button>
+          <button
+            type="button"
+            className="px-1.5 py-2 text-sm font-bold whitespace-nowrap text-[var(--accent)] disabled:opacity-50"
+            aria-label={`按常用路线 ${r.label} 开始行程`}
+            disabled={startDisabled}
+            onClick={() => onQuickStart(r)}
+          >
+            {pendingId === r.id ? "规划中…" : "开始行程"}
+          </button>
+        </span>
+      ))}
+    </div>
+  );
+}
+
 function PlaceChips({
   places,
   fieldLabel,
@@ -1733,19 +2019,22 @@ function PlaceChips({
 
 function RoutePlansPanel({
   data,
+  city,
   onStartTrip,
   starting,
   hasActiveTrip,
 }: {
   data: RoutePlanResult;
+  city: string;
   onStartTrip: (plan: RoutePlan) => void;
   starting: boolean;
   hasActiveTrip: boolean;
 }) {
+  const walk = useWalkTimes(city);
   return (
     <div className="mt-6 space-y-3">
       {data.plans.map((p, i) => {
-        const rides = p.segments.filter((s) => s.type !== "步行");
+        let rideNo = 0;
         return (
           <article key={i} className="border border-[var(--border)] bg-[var(--surface)] px-4 py-3 [border-radius:var(--radius)]">
             <p className="text-lg font-bold text-[var(--text)]">
@@ -1756,14 +2045,69 @@ function RoutePlansPanel({
               方案 {i + 1} · 步行约 {p.walking} 米{p.cost && p.cost !== "0" && p.cost !== "?" ? ` · 票价约 ${p.cost} 元` : ""}
             </p>
             <ol className="mt-2 space-y-1.5">
-              {rides.map((s, j) => (
-                <li key={j} className="text-base text-[var(--text)]">
-                  <span className="mr-1.5 text-[var(--accent)]">{CIRCLES[j] ?? `${j + 1}.`}</span>
-                  {s.departure ? `${s.departure}${s.departure.endsWith("站") ? "" : "站"}` : "起点"} 坐
-                  <span className="font-bold"> {s.name} </span>→{" "}
-                  {s.arrival ? `${s.arrival}${s.arrival.endsWith("站") ? "" : "站"}` : "终点"} 下车
-                </li>
-              ))}
+              {p.segments.map((s, j) => {
+                if (s.type === "步行") {
+                  const dist = Number(s.walkDistance) || 0;
+                  const between =
+                    hasRideBefore(p.segments, j) &&
+                    p.segments.slice(j + 1).some((x) => x.type !== "步行");
+                  // 没有距离又不是换乘步行（高德的占位步行段）不占行
+                  if (dist <= 0 && !between) return null;
+                  const pt = walkPointOf(p.segments, j);
+                  const eff = walk.effective(
+                    pt.station,
+                    pt.nextLine,
+                    defaultWalkMinutes(dist),
+                  );
+                  return (
+                    <li
+                      key={j}
+                      className="flex flex-wrap items-center gap-x-2 gap-y-1 pl-6"
+                    >
+                      <span className="text-sm text-[var(--dim)]">
+                        {between ? "换乘步行" : "步行"}
+                        {dist > 0 ? `约 ${dist} 米 ·` : " ·"}
+                      </span>
+                      <WalkTimeControl
+                        minutes={eff.minutes}
+                        isCustom={eff.isCustom}
+                        onChange={(m) => walk.setMinutes(pt.station, pt.nextLine, m)}
+                        label={
+                          pt.station
+                            ? `${pt.station}${pt.nextLine ? `换乘${pt.nextLine}` : "步行"}`
+                            : "步行段"
+                        }
+                      />
+                    </li>
+                  );
+                }
+                rideNo += 1;
+                const direct = isDirectTransfer(p.segments, j);
+                const effDirect = direct
+                  ? walk.effective(s.departure, s.name, 0)
+                  : null;
+                return (
+                  <li key={j} className="text-base text-[var(--text)]">
+                    <span className="mr-1.5 text-[var(--accent)]">{CIRCLES[rideNo - 1] ?? `${rideNo}.`}</span>
+                    {s.departure ? `${s.departure}${s.departure.endsWith("站") ? "" : "站"}` : "起点"} 坐
+                    <span className="font-bold"> {s.name} </span>→{" "}
+                    {s.arrival ? `${s.arrival}${s.arrival.endsWith("站") ? "" : "站"}` : "终点"} 下车
+                    {direct && effDirect && (
+                      <span className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 pl-6">
+                        <span className="text-sm text-[var(--dim)]">
+                          同站换乘（可能要过街）·
+                        </span>
+                        <WalkTimeControl
+                          minutes={effDirect.minutes}
+                          isCustom={effDirect.isCustom}
+                          onChange={(m) => walk.setMinutes(s.departure, s.name, m)}
+                          label={`${s.departure}换乘${s.name}`}
+                        />
+                      </span>
+                    )}
+                  </li>
+                );
+              })}
             </ol>
             <button
               type="button"
@@ -1786,17 +2130,34 @@ function RoutePlansPanel({
 
 // ---------- 行程模式 ----------
 
+/** 宽裕度结论：余量 = 下一班车分钟数 − 步行分钟数。 */
+function slackVerdict(margin: number): { text: string; className: string } {
+  if (margin >= 3) return { text: "赶得上", className: "text-[var(--accent)]" };
+  if (margin >= 0) return { text: "有点紧", className: "text-[var(--amber)]" };
+  return { text: "赶不上这班", className: "text-[var(--danger)]" };
+}
+
 // 当前段的上车站实时：先只读服务端缓存快照（不调接口），有缓存先
 // 显示；真查询只在用户点「查实时 / 刷新」时发生，复用 queryLineRealtime
 // 的服务端缓存，不自动轮询。换乘段（isTransfer）用琥珀色醒目呈现。
+// walk 传进来时（换乘接驳段，或正在走的步行段的下一段车）同时显示
+// 步行时间调节与宽裕度：余量 = 下一班车还有 M 分钟 − 步行 X 分钟；
+// 实时缺失/报错/班次没有分钟数时只显示步行设置，不给结论、不编造。
 function TripRealtime({
   city,
   seg,
   isTransfer,
+  walk,
 }: {
   city: string;
   seg: TripSegment;
   isTransfer: boolean;
+  walk?: {
+    minutes: number;
+    isCustom: boolean;
+    onChange: (m: number) => void;
+    label: string;
+  };
 }) {
   const snapshot = useQuery({
     queryKey: ["tripRtSnapshot", city, seg.name, seg.departure],
@@ -1824,6 +2185,19 @@ function TripRealtime({
       : data.directions
     : [];
 
+  // 宽裕度：只用第一个有车且没报错的方向算；班次没有分钟数就不算
+  const slackDir = dirs.find((d) => !d.error && d.buses.length > 0);
+  const slackNext = slackDir?.buses[0];
+  const slackSecond = slackDir?.buses[1];
+  const slackMargin =
+    walk && slackNext?.travelMinutes != null
+      ? slackNext.travelMinutes - walk.minutes
+      : null;
+  const slackMargin2 =
+    walk && slackMargin != null && slackMargin < 0 && slackSecond?.travelMinutes != null
+      ? slackSecond.travelMinutes - walk.minutes
+      : null;
+
   return (
     <div
       className={`mt-3 px-3 py-3 [border-radius:8px] ${
@@ -1846,6 +2220,16 @@ function TripRealtime({
           {rtM.isPending ? "查询中…" : data ? "刷新" : "查实时"}
         </button>
       </div>
+      {walk && (
+        <div className="mt-2">
+          <WalkTimeControl
+            minutes={walk.minutes}
+            isCustom={walk.isCustom}
+            onChange={walk.onChange}
+            label={walk.label}
+          />
+        </div>
+      )}
       {error && <p className="mt-2 text-sm text-[var(--danger)]">{error}</p>}
       {!data && !error && (
         <p className="mt-2 text-sm text-[var(--dim)]">
@@ -1869,6 +2253,33 @@ function TripRealtime({
               );
             })}
           </ul>
+          {walk && slackMargin != null && slackNext?.travelMinutes != null && (
+            <div className="mt-2 border-t border-[var(--border)] pt-2 text-sm">
+              <p className="text-[var(--text)]">
+                下一班约 {slackNext.travelMinutes} 分钟到 − 步行 {walk.minutes}{" "}
+                分钟 = 余量 {slackMargin} 分钟 ·{" "}
+                <span className={`font-bold ${slackVerdict(slackMargin).className}`}>
+                  {slackVerdict(slackMargin).text}
+                </span>
+              </p>
+              {slackMargin < 0 &&
+                (slackMargin2 != null && slackSecond?.travelMinutes != null ? (
+                  <p className="mt-1 text-[var(--text)]">
+                    再下一班约 {slackSecond.travelMinutes} 分钟到 · 余量{" "}
+                    {slackMargin2} 分钟 ·{" "}
+                    <span
+                      className={`font-bold ${slackVerdict(slackMargin2).className}`}
+                    >
+                      {slackVerdict(slackMargin2).text}
+                    </span>
+                  </p>
+                ) : (
+                  <p className="mt-1 text-[var(--dim)]">
+                    暂时没有再下一班的数据
+                  </p>
+                ))}
+            </div>
+          )}
           <p className="mt-1.5 text-xs text-[var(--dim)]">
             数据时间 {data.queriedAt}
             {data.cached ? " · 缓存" : ""} · 不自动刷新，点刷新才查
@@ -1897,6 +2308,7 @@ function TripPanel({
   onBack: () => void;
 }) {
   const [confirmEnd, setConfirmEnd] = useState(false);
+  const walk = useWalkTimes(trip.city);
   const current = trip.segments[trip.currentIndex];
   if (!current) return null;
   const isLast = trip.currentIndex === trip.segments.length - 1;
@@ -1928,6 +2340,36 @@ function TripPanel({
           const done = i < trip.currentIndex;
           const isCurrent = i === trip.currentIndex;
           const ride = seg.type !== "步行";
+          // 本段涉及的换乘步行时间：步行段按 walkPointOf 取换乘点；
+          // 紧接上一段车的同站换乘，换乘点就是本段的上车站+本段线路；
+          // 当前接驳段若前面是步行段，默认值取那段步行距离的估算。
+          const walkPt = !ride ? walkPointOf(trip.segments, i) : null;
+          const walkEff =
+            walkPt && !ride
+              ? walk.effective(
+                  walkPt.station,
+                  walkPt.nextLine,
+                  defaultWalkMinutes(Number(seg.walkDistance) || 0),
+                )
+              : null;
+          const direct = ride && isDirectTransfer(trip.segments, i);
+          const directEff = direct
+            ? walk.effective(seg.departure, seg.name, 0)
+            : null;
+          const transferRide = ride && hasRideBefore(trip.segments, i);
+          const prevSeg = i > 0 ? trip.segments[i - 1] : undefined;
+          const curRideEff = transferRide
+            ? walk.effective(
+                seg.departure,
+                seg.name,
+                prevSeg && prevSeg.type === "步行"
+                  ? defaultWalkMinutes(Number(prevSeg.walkDistance) || 0)
+                  : 0,
+              )
+            : null;
+          const nextRideSeg = !ride
+            ? trip.segments.slice(i + 1).find((s) => s.type !== "步行")
+            : undefined;
           return (
             <li
               key={i}
@@ -1965,6 +2407,39 @@ function TripPanel({
                 )}
               </div>
 
+              {!ride && walkPt && walkEff && !(isCurrent && nextRideSeg) && (
+                <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1">
+                  {Number(seg.walkDistance) > 0 && (
+                    <span className="text-sm text-[var(--dim)]">
+                      约 {seg.walkDistance} 米 ·
+                    </span>
+                  )}
+                  <WalkTimeControl
+                    minutes={walkEff.minutes}
+                    isCustom={walkEff.isCustom}
+                    onChange={(m) => walk.setMinutes(walkPt.station, walkPt.nextLine, m)}
+                    label={
+                      walkPt.station
+                        ? `${walkPt.station}${walkPt.nextLine ? `换乘${walkPt.nextLine}` : "步行"}`
+                        : "步行段"
+                    }
+                  />
+                </div>
+              )}
+              {ride && direct && !isCurrent && directEff && (
+                <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1">
+                  <span className="text-sm text-[var(--dim)]">
+                    换乘（同站，可能要过街）·
+                  </span>
+                  <WalkTimeControl
+                    minutes={directEff.minutes}
+                    isCustom={directEff.isCustom}
+                    onChange={(m) => walk.setMinutes(seg.departure, seg.name, m)}
+                    label={`${seg.departure}换乘${seg.name}`}
+                  />
+                </div>
+              )}
+
               {isCurrent && ride && (
                 <>
                   {trip.phase === "riding" && seg.stopCount != null && (
@@ -1976,7 +2451,18 @@ function TripPanel({
                   <TripRealtime
                     city={trip.city}
                     seg={seg}
-                    isTransfer={trip.currentIndex > 0}
+                    isTransfer={transferRide}
+                    walk={
+                      curRideEff
+                        ? {
+                            minutes: curRideEff.minutes,
+                            isCustom: curRideEff.isCustom,
+                            onChange: (m: number) =>
+                              walk.setMinutes(seg.departure, seg.name, m),
+                            label: `${seg.departure}换乘${seg.name}`,
+                          }
+                        : undefined
+                    }
                   />
                   {seg.stops.length > 0 ? (
                     <ol className="mt-3 border-t border-[var(--border)] pt-2">
@@ -2011,9 +2497,27 @@ function TripPanel({
                 </>
               )}
               {isCurrent && !ride && (
-                <p className="mt-2 text-sm text-[var(--dim)]">
-                  跟着导航走到{seg.arrival ? `「${seg.arrival}」` : "下一段上车点"}，走完点下面的按钮。
-                </p>
+                <>
+                  <p className="mt-2 text-sm text-[var(--dim)]">
+                    跟着导航走到{seg.arrival ? `「${seg.arrival}」` : "下一段上车点"}，走完点下面的按钮。
+                  </p>
+                  {nextRideSeg && walkPt && walkEff && (
+                    <TripRealtime
+                      city={trip.city}
+                      seg={nextRideSeg}
+                      isTransfer={hasRideBefore(trip.segments, i)}
+                      walk={{
+                        minutes: walkEff.minutes,
+                        isCustom: walkEff.isCustom,
+                        onChange: (m: number) =>
+                          walk.setMinutes(walkPt.station, walkPt.nextLine, m),
+                        label: walkPt.nextLine
+                          ? `${walkPt.station}换乘${walkPt.nextLine}`
+                          : `${walkPt.station}步行`,
+                      }}
+                    />
+                  )}
+                </>
               )}
             </li>
           );

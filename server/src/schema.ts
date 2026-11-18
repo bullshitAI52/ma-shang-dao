@@ -53,6 +53,24 @@ export const favoritePlaces = sqliteTable("favorite_places", {
     .$defaultFn(() => new Date()),
 });
 
+// 换乘步行时间（用户手动调节）：按「城市 + 换乘站名 + 接驳线路」一条，
+// minutes 是用户设的步行分钟数（0–30）。规划与行程里再遇到同一个换乘点
+// 自动套用；没有记录的换乘点按步行距离 ÷ 80 米/分钟估算。接驳线路为
+// 空串表示行程末尾的步行段（下车站 → 终点）。
+export const transferWalkTimes = sqliteTable("transfer_walk_times", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  city: text("city").notNull().default("厦门"),
+  station: text("station").notNull(),
+  nextLine: text("next_line").notNull().default(""),
+  minutes: integer("minutes").notNull(),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
 // 进行中的行程：全表只存一行（id 固定 1），同时只能有一个进行中行程。
 // segments_json 存所选方案各段的富化信息（线路/上车/下车/站点序切片），
 // current_index 是当前段下标，phase 为 waiting（未上车/步行未走）或

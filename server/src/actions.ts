@@ -745,6 +745,36 @@ const favoritePlacesResponse = z.object({
   ),
 });
 
+// 换乘步行时间：用户按「城市 + 换乘站名 + 接驳线路」手动设的分钟数。
+const transferWalkTimesResponse = z.object({
+  items: z.array(
+    z.object({
+      station: z.string(),
+      nextLine: z.string(),
+      minutes: z.number(),
+    }),
+  ),
+});
+
+async function listTransferWalkTimes(
+  ctx: Ctx,
+  city: string,
+): Promise<z.infer<typeof transferWalkTimesResponse>> {
+  const db = ctx.db<typeof schema>();
+  const rows = await db
+    .select()
+    .from(schema.transferWalkTimes)
+    .where(eq(schema.transferWalkTimes.city, city))
+    .limit(200);
+  return {
+    items: rows.map((r) => ({
+      station: r.station,
+      nextLine: r.nextLine,
+      minutes: r.minutes,
+    })),
+  };
+}
+
 // 行程段：规划方案的段富化后的样子。stops 是按行进方向切出的
 // 上车站→下车站站点序（含两端），拿不到站点序时为空数组、stopCount
 // 为 null，页面如实显示「站数未知」，不编造。
@@ -1672,6 +1702,59 @@ export const Actions = {
         .delete(schema.favoritePlaces)
         .where(eq(schema.favoritePlaces.id, args.id));
       return listFavoritePlaces(ctx, cityOf(args.city));
+    },
+  }),
+
+  getTransferWalkTimes: defineAction({
+    description:
+      "列出用户在某城市手动设过的换乘步行时间：每条是「换乘站名 + 接驳线路 → 分钟数」。规划与行程里遇到同一换乘点时套用用户的值，没有记录的按步行距离估算。city 缺省为厦门。",
+    request: z.object({ city: z.string().max(20).optional() }),
+    response: transferWalkTimesResponse,
+    async handler(ctx, args): Promise<z.infer<typeof transferWalkTimesResponse>> {
+      return listTransferWalkTimes(ctx, cityOf(args.city));
+    },
+  }),
+
+  setTransferWalkTime: defineAction({
+    description:
+      "保存某个换乘点的步行时间（分钟，0–30）：按城市 + 换乘站名 + 接驳线路存，已有同换乘点的记录会被更新，不同换乘点互不影响。返回该城市全部换乘步行设置。接驳线路可为空串（行程末尾步行段）。city 缺省为厦门。",
+    request: z.object({
+      station: z.string().min(1).max(60),
+      nextLine: z.string().max(60),
+      minutes: z.number().int().min(0).max(30),
+      city: z.string().max(20).optional(),
+    }),
+    response: transferWalkTimesResponse,
+    async handler(ctx, args): Promise<z.infer<typeof transferWalkTimesResponse>> {
+      const city = cityOf(args.city);
+      const station = args.station.trim();
+      const nextLine = args.nextLine.trim();
+      const db = ctx.db<typeof schema>();
+      const existing = await db
+        .select()
+        .from(schema.transferWalkTimes)
+        .where(
+          and(
+            eq(schema.transferWalkTimes.city, city),
+            eq(schema.transferWalkTimes.station, station),
+            eq(schema.transferWalkTimes.nextLine, nextLine),
+          ),
+        )
+        .limit(1);
+      if (existing[0]) {
+        await db
+          .update(schema.transferWalkTimes)
+          .set({ minutes: args.minutes, updatedAt: new Date() })
+          .where(eq(schema.transferWalkTimes.id, existing[0].id));
+      } else {
+        await db.insert(schema.transferWalkTimes).values({
+          city,
+          station,
+          nextLine,
+          minutes: args.minutes,
+        });
+      }
+      return listTransferWalkTimes(ctx, city);
     },
   }),
 
