@@ -418,6 +418,15 @@ function mergeNames(base: string[], add: string[], cap: number): string[] {
   return out.slice(0, cap);
 }
 
+// 终点站名必须是中文站名：曾有来源把拼音碎片（如 "gong yu lo"，字间
+// 带 U+2006 窄空格）当 33 路的终点站沉淀进点选缓存，画布方向三角
+// 翻转时翻到的就是这串英文、永远到不了真正的另一端终点（高崎公交
+// 场站）。沉淀与读取时一律滤掉不含中文字符的「终点站」，已存的坏值
+// 在下一次写回时自动清掉（另有迁移 0015 直接纠正 33 路已存数据）。
+const hasCjk = (s: string) => /[\u3400-\u9fff]/.test(s);
+const cleanTerminals = (names: string[]): string[] =>
+  names.filter((n) => hasCjk(n));
+
 async function readLineInfo(
   ctx: Ctx,
   city: string,
@@ -445,7 +454,7 @@ async function readLineInfo(
     const r = rows[0];
     if (!r) return empty;
     return {
-      terminals: parseStrArr(r.terminalsJson),
+      terminals: cleanTerminals(parseStrArr(r.terminalsJson)),
       stops1: parseStrArr(r.stops1Json),
       stops2: parseStrArr(r.stops2Json),
       extraStations: parseStrArr(r.extraStationsJson),
@@ -471,7 +480,7 @@ async function rememberLineInfo(
     const cur = await readLineInfo(ctx, city, line);
     const next: LineInfo = {
       terminals: patch.terminals
-        ? mergeNames(cur.terminals, patch.terminals, 6)
+        ? mergeNames(cur.terminals, cleanTerminals(patch.terminals), 6)
         : cur.terminals,
       stops1:
         patch.directionStops?.direction === 1 &&
@@ -492,7 +501,7 @@ async function rememberLineInfo(
       if (stops.length > 0) {
         next.terminals = mergeNames(
           next.terminals,
-          [stops[0] ?? "", stops[stops.length - 1] ?? ""],
+          cleanTerminals([stops[0] ?? "", stops[stops.length - 1] ?? ""]),
           6,
         );
       }
@@ -570,7 +579,7 @@ async function amapLineInfo(
       if (base !== line) continue;
       info.terminals = mergeNames(
         info.terminals,
-        [str(b.start_stop), str(b.end_stop)],
+        cleanTerminals([str(b.start_stop), str(b.end_stop)]),
         6,
       );
       const stops = arr(b.busstops)
@@ -2562,8 +2571,9 @@ export const Actions = {
           );
         }
       }
-      // 沉淀与缓存都没有终点站时，高德线路检索兜底一次并沉淀
-      if (info.terminals.length === 0) {
+      // 有效终点站不足两个（没有、或只剩一个、或坏值被滤掉后不够一对）
+      // 时，高德线路检索兜底一次并沉淀：方向三角要凑齐一对终点才能翻转
+      if (info.terminals.length < 2) {
         const am = await amapLineInfo(ctx, city, line);
         if (am) {
           info.terminals = mergeNames(info.terminals, am.terminals, 6);

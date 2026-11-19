@@ -373,6 +373,16 @@ export function App() {
     setRtFail("");
     rt.mutate({ line: rtLine, station: rtStation });
   };
+  // 错误框的「重试」：输入被清掉时不静默跳过，提示缺什么
+  const retryRt = () => {
+    if (!rtLine.trim() || !rtStation.trim()) {
+      setRtFormError("线路和站名都要填，缺一个查不了。");
+      return;
+    }
+    setRtFormError("");
+    setRtFail("");
+    rt.mutate({ line: rtLine, station: rtStation });
+  };
 
   // 线路详情
   const [ldFail, setLdFail] = useState("");
@@ -393,6 +403,17 @@ export function App() {
   };
   const onLineSubmit = (e: FormEvent) => {
     e.preventDefault();
+    if (!lineInput.trim()) {
+      setLdFormError("先填线路号再查。");
+      return;
+    }
+    setLdFormError("");
+    setLdFail("");
+    setLdDir(0);
+    ld.mutate(lineInput);
+  };
+  // 错误框的「重试」：线路号被清掉时不静默跳过，提示先填
+  const retryLd = () => {
     if (!lineInput.trim()) {
       setLdFormError("先填线路号再查。");
       return;
@@ -1042,21 +1063,9 @@ export function App() {
                   <p className="mt-3 text-sm text-[var(--danger)]">{rtFormError}</p>
                 )}
                 {rt.data && !rt.data.ok && (
-                  <ErrorBox
-                    message={rt.data.error}
-                    onRetry={() => rtLine.trim() && rtStation.trim() && rt.mutate({ line: rtLine, station: rtStation })}
-                  />
+                  <ErrorBox message={rt.data.error} onRetry={retryRt} />
                 )}
-                {rtFail && (
-                  <ErrorBox
-                    message={rtFail}
-                    onRetry={() => {
-                      if (!rtLine.trim() || !rtStation.trim()) return;
-                      setRtFail("");
-                      rt.mutate({ line: rtLine, station: rtStation });
-                    }}
-                  />
-                )}
+                {rtFail && <ErrorBox message={rtFail} onRetry={retryRt} />}
                 {rt.data?.ok && (
                   <RealtimePanel
                     data={rt.data}
@@ -1102,17 +1111,8 @@ export function App() {
                 {ldFormError && (
                   <p className="mt-3 text-sm text-[var(--danger)]">{ldFormError}</p>
                 )}
-                {ld.data && !ld.data.ok && <ErrorBox message={ld.data.error} onRetry={() => lineInput.trim() && ld.mutate(lineInput)} />}
-                {ldFail && (
-                  <ErrorBox
-                    message={ldFail}
-                    onRetry={() => {
-                      if (!lineInput.trim()) return;
-                      setLdFail("");
-                      ld.mutate(lineInput);
-                    }}
-                  />
-                )}
+                {ld.data && !ld.data.ok && <ErrorBox message={ld.data.error} onRetry={retryLd} />}
+                {ldFail && <ErrorBox message={ldFail} onRetry={retryLd} />}
                 {ld.data?.ok && (
                   <LineDetailPanel
                     data={ld.data}
@@ -5566,7 +5566,9 @@ function CanvasStationCard({
     queryFn: () => api.getLinePickOptions({ city }),
     enabled: picker === "line",
   });
-  // 终点站选项：服务端给的 + 这张卡已查到的实时结果自带的双向终点
+  // 终点站选项：服务端给的 + 这张卡已查到的实时结果自带的双向终点。
+  // 只留含中文字符的站名：曾有拼音碎片（如 "gong yu lo"）混进终点
+  // 选项，三角翻转会翻到它、永远到不了真正的另一端终点
   const pickTerminals = Array.from(
     new Set([
       ...(pickQ.data?.terminals ?? []),
@@ -5574,7 +5576,7 @@ function CanvasStationCard({
         .map((d) => d.terminal)
         .filter((t) => t !== "") ?? []),
     ]),
-  );
+  ).filter((t) => /[\u3400-\u9fff]/.test(t));
   const pickStops = pickQ.data?.stops ?? [];
   const recentLines = (recentQ.data?.recentLines ?? []).filter(
     (l) => l !== mod.line,
