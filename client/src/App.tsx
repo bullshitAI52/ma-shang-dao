@@ -3529,8 +3529,8 @@ function CanvasView({
   // 此刻呈现的那一份）按模块 id 同步到这里：文字版模式直接读这份
   // 状态渲染，两边永远是同一份数据、文字版没有自己的副本。卡片还
   // 没挂载过（直接以文字版打开画布）时，文字版退回上面的缓存快照
-  // entry——那正是卡片首屏用的同一份。文字版自身不发起任何查询，
-  // 数据新鲜度仍由卡片的开始 / 点查驱动。
+  // entry——那正是卡片首屏用的同一份。文字版的「全部刷新」也把
+  // 逐张查询的结果写进这同一份 rtReports，不另存副本。
   const [rtReports, setRtReports] = useState<
     ReadonlyMap<number, { data: RealtimeResult | null; error: string }>
   >(new Map());
@@ -3546,6 +3546,57 @@ function CanvasView({
     },
     [],
   );
+
+  // 文字版「全部刷新」：一次性手动刷新当前项目里所有已填好站名+线路
+  // 的到站卡——逐张走与卡片点查完全相同的 queryLineRealtime（同一
+  // 接口、同一 90 秒服务端缓存），结果写回同一份 rtReports，文字版
+  // 与卡片两边同步。不管卡片是开始还是停止都查这一次，但不改任何
+  // 卡的启停状态、不开启自动轮询。某张失败（报错原文）只记到那张
+  // 卡名下，不中断其余卡。refreshProgress 非空即刷新进行中。
+  const refreshTargets = modules.filter(
+    (m) => m.kind === "station" && m.line.trim() && m.station.trim(),
+  );
+  const [refreshProgress, setRefreshProgress] = useState<{
+    done: number;
+    total: number;
+  } | null>(null);
+  const [lastRefreshedAt, setLastRefreshedAt] = useState("");
+  const refreshAll = async () => {
+    if (refreshProgress) return;
+    const targets = refreshTargets;
+    if (targets.length === 0) return;
+    setRefreshProgress({ done: 0, total: targets.length });
+    let done = 0;
+    for (const m of targets) {
+      try {
+        const res = await api.queryLineRealtime({
+          line: m.line,
+          station: m.station,
+          city,
+        });
+        if (res.ok) reportRt(m.id, res, "");
+        else reportRt(m.id, null, res.error);
+      } catch (e) {
+        reportRt(
+          m.id,
+          null,
+          `查询失败：${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+      done += 1;
+      setRefreshProgress({ done, total: targets.length });
+    }
+    setRefreshProgress(null);
+    const now = new Date();
+    setLastRefreshedAt(
+      `${now.getHours()}:${String(now.getMinutes()).padStart(2, "0")}`,
+    );
+    // 服务端缓存已被逐张查询刷新过：让快照重读，卡片切回来时首屏
+    // 用的 entry 也同步到这次结果
+    void queryClient.invalidateQueries({
+      queryKey: ["canvasSnapshot", city],
+    });
+  };
 
   const applyCanvas = (data: CanvasData) => {
     queryClient.setQueryData(["canvas", city, data.projectId], data);
@@ -4481,7 +4532,8 @@ function CanvasView({
   // 开往方向与第 1 / 第 2 班；实时状态读 rtReports 里卡片同步来的
   // 当前显示状态（点查结果、暂无车、报错都如实带过来），卡片还没
   // 挂载过时退回缓存快照 entry，与卡片首屏同源。文字版不看折叠
-  // 状态（整棵树全展开，方便一眼看全），自身不发起任何查询 ----
+  // 状态（整棵树全展开，方便一眼看全）；刷新只经顶部的「全部
+  // 刷新」一次性逐张查询，结果仍写回同一份 rtReports ----
   const renderTextNode = (
     node: CanvasTreeNode,
     prefix: string,
@@ -4511,12 +4563,17 @@ function CanvasView({
       // 与卡片完全同口径地选方向：先按方向号、再按终点站名，方向
       // 未定时优先有车的方向
       const rep = rtReports.get(m.id);
-      const data: RealtimeResult | null = !m.enabled
-        ? null
-        : rep
-          ? rep.data
-          : (entryOf(m.id)?.realtime ?? null);
-      const rtError = !m.enabled ? "" : rep ? rep.error : "";
+      // 「全部刷新」给停止的卡也查过一次时，rep 里带着数据或报错：
+      // 这一次的结果照样显示（启停状态本身不变）；没有这种结果的
+      // 停止卡仍按待机显示
+      const hasFresh = !!rep && (rep.data !== null || rep.error !== "");
+      const data: RealtimeResult | null =
+        !m.enabled && !hasFresh
+          ? null
+          : rep
+            ? rep.data
+            : (entryOf(m.id)?.realtime ?? null);
+      const rtError = !m.enabled && !hasFresh ? "" : rep ? rep.error : "";
       const dirUnset = m.direction === 0 && !m.terminal;
       const dir =
         data?.directions.find((d) => d.direction === m.direction) ??
@@ -4545,7 +4602,7 @@ function CanvasView({
           {terminalText ? `开往 ${terminalText}` : "方向未填"}
         </span>,
       );
-      if (!m.enabled) {
+      if (!m.enabled && !hasFresh) {
         details.push(
           <span key="stopped" className="text-[var(--dim)]">
             已停止 · 待机中，不查车
@@ -5602,6 +5659,31 @@ function CanvasView({
               {templateFlash}
             </p>
           )}
+          {modules.length > 0 && (
+            <div className="mb-2 flex flex-wrap items-center gap-2 px-1">
+              <button
+                type="button"
+                onClick={() => void refreshAll()}
+                disabled={refreshProgress !== null || refreshTargets.length === 0}
+                aria-label="全部刷新：逐张查询当前项目里所有已填好站名和线路的到站卡（开始和停止的都查一次，不改变启停状态）"
+                className="min-h-10 bg-[var(--accent)] px-4 text-base font-bold text-[var(--accent-ink)] [border-radius:8px] disabled:opacity-50"
+              >
+                {refreshProgress
+                  ? `刷新中 ${refreshProgress.done}/${refreshProgress.total}…`
+                  : "↻ 全部刷新"}
+              </button>
+              {refreshProgress === null && lastRefreshedAt && (
+                <span className="text-sm text-[var(--dim)]" role="status">
+                  已更新 {lastRefreshedAt}
+                </span>
+              )}
+              {refreshTargets.length === 0 && (
+                <span className="text-sm text-[var(--dim)]">
+                  还没有填好站名和线路的到站卡可刷新
+                </span>
+              )}
+            </div>
+          )}
           {modules.length === 0 ? (
             <p className="px-2 py-10 text-center text-base leading-relaxed text-[var(--dim)]">
               还没有模块。点上面「＋ 加模块」放一张空白到站卡，或从模块库调用、从规划转进来，第一张卡就会出现在这里。
@@ -5631,7 +5713,7 @@ function CanvasView({
           操作说明（点开看）
         </summary>
         <p className="pb-1 text-xs leading-relaxed text-[var(--dim)]">
-          三种看法：自由画布自由拖动摆布，拖模块本体移动它（点中或拖动的模块会自动翻到最前），拖空白处平移画布，双指或滚轮缩放；纵向流是路线树，像二叉树一样分叉：顶层卡自上而下是主线（卡间向下的大箭头是「然后」），一张卡下面缩进挂着的子卡是它分出的不同路线，同父的子卡之间标「或」任选其一，子卡下面还能再挂子卡、继续往下分。文字版把同一棵路线树写成纯文字：每张卡一行站名、线路、开往方向和第 1 班 / 第 2 班，子卡缩进并用树形符号相连、同父子卡之间标「或」，整棵树全展开；它和卡片共用同一份数据——在卡片上开始 / 点查后切过来，看到的就是卡片此刻的最新结果（暂无车、报错也一样），文字版自己不查车，想更新先回卡片点查。带子卡的卡能点「收起」把整条支线折成一行摘要，点摘要重新展开，收起状态会记住。卡面只留核心信息（站名/线路/方向/第 1 班/第 2 班/数据时间）和一行操作（开始/停止、点查、更多）；存库、删除、备注、挂接都收在卡片的「更多」里，点开才显示，一次只开一张。挂接：在「更多」里点「挂到某张卡后面」再点选一张卡，这张卡就成为它的子卡（分支路线）；「移到顶层」解除挂接回到主线；不能挂到自己或自己的子卡下面（会绕成圈）。续接新卡不用挂接：在某张卡的「更多」顶部点「＋ 在后面加一张」，新卡直接生在它下面接着往下；点「＋ 加并列方案」，新卡和它同层并列、中间是「或」。加的都是空白到站卡，落下后点选站名线路即可。「＋ 加模块」新放的卡默认在顶层主线。自由画布里每张卡左上角有步号徽章（旧的步骤编号，同一步多卡标方案A/B/C）。连线（自由画布）：按住模块右侧的蓝点拖到另一个模块上松手（虚线带箭头）；整删在卡片「更多」里点「删除」（会先确认一次；删掉一张卡，它的子卡会自动改挂到它的上一级）。到站卡可开始/停止：停止后变灰待机、不查车；点「开始」只当场查一次，之后不自动刷新，想看最新就点卡上的「点查/刷新」再查（走 90 秒缓存）。打开画布不自动查车：有缓存先看缓存。到站卡前三行（站名/线路/方向）点一下先出可选项点选——方向行点 ◀ ▶ 直接在两个终点站之间切换、点方向文字出终点站二选一，站名从站序里挑、线路从你用过的里面挑，实在没有选项才打字，选完自动保存；「＋ 加模块」里可以直接放一张空白卡，不用先查线路。配好的模块点卡片「更多」里的「存库」存入模块库，之后在「＋ 加模块 → 我的模块库」点一下就放一份副本到画布上，副本和模板互不影响。页头点项目名可以切换项目，「⋯」菜单里新建、改名、删除项目。项目里的模块、连线、位置改完即存，切走再回来原样恢复。
+          三种看法：自由画布自由拖动摆布，拖模块本体移动它（点中或拖动的模块会自动翻到最前），拖空白处平移画布，双指或滚轮缩放；纵向流是路线树，像二叉树一样分叉：顶层卡自上而下是主线（卡间向下的大箭头是「然后」），一张卡下面缩进挂着的子卡是它分出的不同路线，同父的子卡之间标「或」任选其一，子卡下面还能再挂子卡、继续往下分。文字版把同一棵路线树写成纯文字：每张卡一行站名、线路、开往方向和第 1 班 / 第 2 班，子卡缩进并用树形符号相连、同父子卡之间标「或」，整棵树全展开；它和卡片共用同一份数据——在卡片上开始 / 点查后切过来，看到的就是卡片此刻的最新结果（暂无车、报错也一样）；文字版顶部有「全部刷新」，点一次把当前项目里所有填好站名和线路的到站卡逐张查一遍（开始、停止的都查，只查这一次、不改启停状态、之后不自动刷新），结果同步回文字版和卡片，某张查失败只在那一行显示报错、不影响其他卡。带子卡的卡能点「收起」把整条支线折成一行摘要，点摘要重新展开，收起状态会记住。卡面只留核心信息（站名/线路/方向/第 1 班/第 2 班/数据时间）和一行操作（开始/停止、点查、更多）；存库、删除、备注、挂接都收在卡片的「更多」里，点开才显示，一次只开一张。挂接：在「更多」里点「挂到某张卡后面」再点选一张卡，这张卡就成为它的子卡（分支路线）；「移到顶层」解除挂接回到主线；不能挂到自己或自己的子卡下面（会绕成圈）。续接新卡不用挂接：在某张卡的「更多」顶部点「＋ 在后面加一张」，新卡直接生在它下面接着往下；点「＋ 加并列方案」，新卡和它同层并列、中间是「或」。加的都是空白到站卡，落下后点选站名线路即可。「＋ 加模块」新放的卡默认在顶层主线。自由画布里每张卡左上角有步号徽章（旧的步骤编号，同一步多卡标方案A/B/C）。连线（自由画布）：按住模块右侧的蓝点拖到另一个模块上松手（虚线带箭头）；整删在卡片「更多」里点「删除」（会先确认一次；删掉一张卡，它的子卡会自动改挂到它的上一级）。到站卡可开始/停止：停止后变灰待机、不查车；点「开始」只当场查一次，之后不自动刷新，想看最新就点卡上的「点查/刷新」再查（走 90 秒缓存）。打开画布不自动查车：有缓存先看缓存。到站卡前三行（站名/线路/方向）点一下先出可选项点选——方向行点 ◀ ▶ 直接在两个终点站之间切换、点方向文字出终点站二选一，站名从站序里挑、线路从你用过的里面挑，实在没有选项才打字，选完自动保存；「＋ 加模块」里可以直接放一张空白卡，不用先查线路。配好的模块点卡片「更多」里的「存库」存入模块库，之后在「＋ 加模块 → 我的模块库」点一下就放一份副本到画布上，副本和模板互不影响。页头点项目名可以切换项目，「⋯」菜单里新建、改名、删除项目。项目里的模块、连线、位置改完即存，切走再回来原样恢复。
         </p>
       </details>
     </section>
