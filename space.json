@@ -2,7 +2,7 @@
   "entry": "client/dist/index.html",
   "managedCronJobs": [],
   "name": "马上到",
-  "platformVersion": 28,
+  "platformVersion": 29,
   "runtime": "typescript",
   "slug": "sha-men-gong-jiao"
 }

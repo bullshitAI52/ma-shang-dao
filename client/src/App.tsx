@@ -7,8 +7,27 @@ import {
   type ReactNode,
 } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { SafeAreaTopScrim } from "@hatch/space-sdk/client";
+import {
+  SafeAreaTopScrim,
+  SpaceActionError,
+  setFailureNoticeText,
+} from "@hatch/space-sdk/client";
+import { actionFields } from "@hatch/space-sdk/fields" with { type: "macro" };
+import type { Actions } from "../../server/src/actions";
 import { api, type ApiResponse } from "./api";
+
+// 表单输入的长度/范围限制直接取自服务端动作的请求模式，页面与服务端
+// 不会各说一套；每个喂给受限字段的输入都展开对应的 FIELDS 条目。
+const FIELDS = actionFields<typeof Actions>();
+
+// 保存失败的底部提示用中文措辞：服务端自己给的报错原文已是中文、直接
+// 用；请求字段校验失败（英文默认消息）换成一句中文提示。
+setFailureNoticeText((error, message) => {
+  if (error instanceof SpaceActionError && error.issues.length > 0) {
+    return "填写的内容不符合要求，请检查后再试一次。";
+  }
+  return message;
+});
 
 // ---------- types derived from actions ----------
 
@@ -255,6 +274,7 @@ function WalkTimeControl({
         −
       </button>
       <input
+        {...FIELDS.setTransferWalkTime.minutes}
         value={draft ?? String(minutes)}
         onChange={(e) => setDraft(e.target.value)}
         onBlur={commitDraft}
@@ -327,25 +347,39 @@ export function App() {
   };
 
   // 实时到站（缓存期内重复查询走服务端缓存，forceRefresh 才真调接口）
+  const [rtFail, setRtFail] = useState("");
+  const [rtFormError, setRtFormError] = useState("");
   const rt = useMutation({
     mutationFn: (args: { line: string; station: string; forceRefresh?: boolean }) =>
       api.queryLineRealtime({ ...args, city }),
+    onError: (e) => setRtFail(`查询失败：${e.message}`),
   });
   const runRealtime = (line: string, station: string) => {
     setRtLine(line);
     setRtStation(station);
     setHomeMode("query");
     setTab("home");
+    setRtFail("");
+    setRtFormError("");
     rt.mutate({ line, station });
   };
   const onRtSubmit = (e: FormEvent) => {
     e.preventDefault();
-    if (rtLine.trim() && rtStation.trim()) rt.mutate({ line: rtLine, station: rtStation });
+    if (!rtLine.trim() || !rtStation.trim()) {
+      setRtFormError("线路和站名都要填，缺一个查不了。");
+      return;
+    }
+    setRtFormError("");
+    setRtFail("");
+    rt.mutate({ line: rtLine, station: rtStation });
   };
 
   // 线路详情
+  const [ldFail, setLdFail] = useState("");
+  const [ldFormError, setLdFormError] = useState("");
   const ld = useMutation({
     mutationFn: (line: string) => api.getLineDetail({ line, city }),
+    onError: (e) => setLdFail(`查询失败：${e.message}`),
   });
   const [ldDir, setLdDir] = useState(0);
   const runLineDetail = (line: string) => {
@@ -353,14 +387,20 @@ export function App() {
     setHomeMode("line");
     setTab("home");
     setLdDir(0);
+    setLdFail("");
+    setLdFormError("");
     ld.mutate(line);
   };
   const onLineSubmit = (e: FormEvent) => {
     e.preventDefault();
-    if (lineInput.trim()) {
-      setLdDir(0);
-      ld.mutate(lineInput);
+    if (!lineInput.trim()) {
+      setLdFormError("先填线路号再查。");
+      return;
     }
+    setLdFormError("");
+    setLdFail("");
+    setLdDir(0);
+    ld.mutate(lineInput);
   };
 
   // 站点
@@ -378,19 +418,28 @@ export function App() {
     setTab("home");
     sa.mutate({ station: name });
   };
+  const [ssFormError, setSsFormError] = useState("");
   const onStationSubmit = (e: FormEvent) => {
     e.preventDefault();
-    if (stationInput.trim()) ss.mutate(stationInput);
+    if (!stationInput.trim()) {
+      setSsFormError("先填站名关键词再搜。");
+      return;
+    }
+    setSsFormError("");
+    ss.mutate(stationInput);
   };
 
   // 附近站点（只在用户点按钮时请求一次定位，不自动轮询）
+  const [nbFail, setNbFail] = useState("");
   const nb = useMutation({
     mutationFn: (args: { lng: number; lat: number }) => api.findNearbyStations(args),
+    onError: (e) => setNbFail(`搜索失败：${e.message}`),
   });
   const [locating, setLocating] = useState(false);
   const [locError, setLocError] = useState("");
   const findNearby = () => {
     setLocError("");
+    setNbFail("");
     if (!("geolocation" in navigator)) {
       setLocError("这个设备/浏览器不支持定位，无法查找附近站点。");
       return;
@@ -419,18 +468,29 @@ export function App() {
   // 把当前起点/终点存为常用地点时的命名表单（目标字段 + 名字输入）
   const [savePlaceTarget, setSavePlaceTarget] = useState<"origin" | "destination" | null>(null);
   const [savePlaceName, setSavePlaceName] = useState("");
+  const [rpFail, setRpFail] = useState("");
+  const [routeFormError, setRouteFormError] = useState("");
   const rp = useMutation({
     mutationFn: (args: { origin: string; destination: string }) =>
       api.planRoute({ ...args, city }),
+    onError: (e) => setRpFail(`规划失败：${e.message}`),
   });
   const onRouteSubmit = (e: FormEvent) => {
     e.preventDefault();
-    if (origin.trim() && destination.trim()) rp.mutate({ origin, destination });
+    if (!origin.trim() || !destination.trim()) {
+      setRouteFormError("起点和终点都要填，缺一个规划不了。");
+      return;
+    }
+    setRouteFormError("");
+    setRpFail("");
+    rp.mutate({ origin, destination });
   };
   const runRoute = (o: string, d: string) => {
     setOrigin(o);
     setDestination(d);
     setTab("route");
+    setRouteFormError("");
+    setRpFail("");
     rp.mutate({ origin: o, destination: d });
   };
 
@@ -453,9 +513,16 @@ export function App() {
     (r) => r.origin === origin.trim() && r.destination === destination.trim(),
   );
   const toggleCurrentRouteFav = () => {
-    if (currentRouteFav) removeFavRoute.mutate(currentRouteFav.id);
-    else if (origin.trim() && destination.trim())
-      addFavRoute.mutate({ origin: origin.trim(), destination: destination.trim() });
+    if (currentRouteFav) {
+      removeFavRoute.mutate(currentRouteFav.id);
+      return;
+    }
+    if (!origin.trim() || !destination.trim()) {
+      setRouteFormError("起点和终点都填好，才能收藏为常用路线。");
+      return;
+    }
+    setRouteFormError("");
+    addFavRoute.mutate({ origin: origin.trim(), destination: destination.trim() });
   };
 
   // 常用地点（按城市隔离，服务端存）
@@ -481,6 +548,7 @@ export function App() {
   });
   const activeTrip = tripQ.data?.trip ?? null;
   const [tripFinished, setTripFinished] = useState(false);
+  const [startTripFail, setStartTripFail] = useState("");
   const startTripMut = useMutation({
     mutationFn: (args: { origin: string; destination: string; plan: RoutePlan }) =>
       api.startTrip({
@@ -492,11 +560,14 @@ export function App() {
     onSuccess: (data) => {
       queryClient.setQueryData(["activeTrip"], data);
       setTripFinished(false);
+      setStartTripFail("");
       setTab("trip");
     },
+    onError: (e) => setStartTripFail(`开始行程失败：${e.message}`),
   });
   const startTrip = (plan: RoutePlan) => {
     if (origin.trim() && destination.trim()) {
+      setStartTripFail("");
       startTripMut.mutate({ origin: origin.trim(), destination: destination.trim(), plan });
     }
   };
@@ -505,6 +576,7 @@ export function App() {
   // （乘车段→到站模块、步行段→文本模块、终点→文本模块，依次连线），
   // 排在画布现有内容下方。转完跳画布页，并让画布把新链滚到视口顶部。
   const [canvasFocus, setCanvasFocus] = useState<{ y: number; nonce: number } | null>(null);
+  const [toCanvasFail, setToCanvasFail] = useState("");
   const toCanvasMut = useMutation({
     mutationFn: (args: {
       origin: string;
@@ -528,7 +600,9 @@ export function App() {
       }
       return api.importPlanToCanvas({ ...args, city, projectId: pid });
     },
+    onError: (e) => setToCanvasFail(`转到画布失败：${e.message}`),
     onSuccess: (data) => {
+      setToCanvasFail("");
       const prev = queryClient.getQueryData<CanvasData>(["canvasLatest", city]);
       const prevIds = new Set(
         prev && prev.projectId === data.projectId
@@ -549,6 +623,7 @@ export function App() {
   });
   const planToCanvas = (plan: RoutePlan) => {
     if (origin.trim() && destination.trim()) {
+      setToCanvasFail("");
       toCanvasMut.mutate({
         origin: origin.trim(),
         destination: destination.trim(),
@@ -558,6 +633,7 @@ export function App() {
   };
   const tripToCanvas = () => {
     if (!activeTrip) return;
+    setToCanvasFail("");
     toCanvasMut.mutate({
       origin: activeTrip.origin,
       destination: activeTrip.destination,
@@ -577,6 +653,7 @@ export function App() {
   // 方案。已有进行中行程时不静默覆盖：先置 pendingQuickRoute 弹确认，
   // 用户点「结束并开始新行程」才真正执行替换。
   const [pendingQuickRoute, setPendingQuickRoute] = useState<FavRoute | null>(null);
+  const [quickFail, setQuickFail] = useState("");
   const quickStartMut = useMutation({
     mutationFn: async (r: FavRoute) => {
       const res = await api.planRoute({ origin: r.origin, destination: r.destination, city });
@@ -594,20 +671,25 @@ export function App() {
       queryClient.setQueryData(["activeTrip"], data);
       setTripFinished(false);
       setPendingQuickRoute(null);
+      setQuickFail("");
       setTab("trip");
     },
+    onError: (e) => setQuickFail(`开始行程失败：${e.message}`),
   });
   const quickStartTrip = (r: FavRoute) => {
     quickStartMut.reset();
+    setQuickFail("");
     if (activeTrip) setPendingQuickRoute(r);
     else quickStartMut.mutate(r);
   };
   const quickPendingId = quickStartMut.isPending
     ? (quickStartMut.variables?.id ?? null)
     : null;
+  const [advanceFail, setAdvanceFail] = useState("");
   const advanceTripMut = useMutation({
     mutationFn: () => api.advanceTrip({}),
     onSuccess: (data) => {
+      setAdvanceFail("");
       if (data.trip?.finished) {
         // 行程完成：服务端已清除进行中状态，本地展示到达页
         queryClient.setQueryData(["activeTrip"], { trip: null });
@@ -616,6 +698,7 @@ export function App() {
         queryClient.setQueryData(["activeTrip"], data);
       }
     },
+    onError: (e) => setAdvanceFail(`推进失败：${e.message}`),
   });
   const endTripMut = useMutation({
     mutationFn: () => api.endTrip({}),
@@ -685,11 +768,17 @@ export function App() {
 
   // 统一智能搜索（解析规则照机器人 parse_input）：一个输入自动分发到对应功能并直接出结果
   const [smart, setSmart] = useState("");
+  const [smartError, setSmartError] = useState("");
+  const [cityFormError, setCityFormError] = useState("");
   const LINE_TOKEN = /^(\d+|快\d+|m\d+|brt)路?$/i;
   const onSmartSubmit = (e: FormEvent) => {
     e.preventDefault();
     const s = smart.trim();
-    if (!s) return;
+    if (!s) {
+      setSmartError("先输入线路、站名，或「起点 终点」，再点搜。");
+      return;
+    }
+    setSmartError("");
     // 含「地铁/号线」→ 地铁信息
     if (s.includes("地铁") || s.includes("号线")) {
       setTab("metro");
@@ -731,29 +820,46 @@ export function App() {
         {/* 顶部：只保留城市切换 + 统一搜索 */}
         <header className="sticky top-0 z-10 -mx-4 border-b border-[var(--border)] bg-[var(--bg)] px-4 pt-3 pb-3">
           {customCityMode ? (
-            <form
-              className="flex gap-2"
-              onSubmit={(e) => {
-                e.preventDefault();
-                switchCity(customCityInput);
-              }}
-            >
-              <input
-                className={inputCls}
-                value={customCityInput}
-                onChange={(e) => setCustomCityInput(e.target.value)}
-                placeholder="输入城市名，如：合肥"
-                aria-label="自定义城市名"
-                autoComplete="off"
-                autoFocus
-              />
-              <button type="submit" className={submitCls} disabled={!customCityInput.trim()}>
-                切换
-              </button>
-              <button type="button" className={ghostBtnCls} onClick={() => setCustomCityMode(false)}>
-                取消
-              </button>
-            </form>
+            <div>
+              <form
+                className="flex gap-2"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  if (!customCityInput.trim()) {
+                    setCityFormError("先输入城市名再切换。");
+                    return;
+                  }
+                  setCityFormError("");
+                  switchCity(customCityInput);
+                }}
+              >
+                <input
+                  className={inputCls}
+                  value={customCityInput}
+                  onChange={(e) => setCustomCityInput(e.target.value)}
+                  placeholder="输入城市名，如：合肥"
+                  aria-label="自定义城市名"
+                  autoComplete="off"
+                  autoFocus
+                />
+                <button type="submit" className={submitCls} disabled={!customCityInput.trim()}>
+                  切换
+                </button>
+                <button
+                  type="button"
+                  className={ghostBtnCls}
+                  onClick={() => {
+                    setCityFormError("");
+                    setCustomCityMode(false);
+                  }}
+                >
+                  取消
+                </button>
+              </form>
+              {cityFormError && (
+                <p className="mt-2 text-sm text-[var(--danger)]">{cityFormError}</p>
+              )}
+            </div>
           ) : (
             <div className="flex gap-2">
               <select
@@ -801,6 +907,9 @@ export function App() {
               </button>
             </div>
           )}
+          {smartError && (
+            <p className="mt-2 text-sm text-[var(--danger)]">{smartError}</p>
+          )}
         </header>
 
         {/* 一键开始行程：已有进行中行程时的替换确认（不静默覆盖） */}
@@ -838,11 +947,9 @@ export function App() {
             </div>
           </div>
         )}
-        {quickStartMut.isError && (
+        {quickFail && (
           <div className="mt-4">
-            <ErrorBox
-              message={`开始行程失败：${quickStartMut.error instanceof Error ? quickStartMut.error.message : String(quickStartMut.error)}`}
-            />
+            <ErrorBox message={quickFail} />
           </div>
         )}
 
@@ -901,6 +1008,7 @@ export function App() {
                       线路（例：33、快1路、BRT、M36）
                     </label>
                     <input
+                      {...FIELDS.queryLineRealtime.line}
                       id="rt-line"
                       className={inputCls}
                       value={rtLine}
@@ -915,6 +1023,7 @@ export function App() {
                     </label>
                     <div className="flex gap-2">
                       <input
+                        {...FIELDS.queryLineRealtime.station}
                         id="rt-station"
                         className={inputCls}
                         value={rtStation}
@@ -929,14 +1038,24 @@ export function App() {
                   </div>
                 </form>
 
+                {rtFormError && (
+                  <p className="mt-3 text-sm text-[var(--danger)]">{rtFormError}</p>
+                )}
                 {rt.data && !rt.data.ok && (
                   <ErrorBox
                     message={rt.data.error}
                     onRetry={() => rtLine.trim() && rtStation.trim() && rt.mutate({ line: rtLine, station: rtStation })}
                   />
                 )}
-                {rt.isError && (
-                  <ErrorBox message={`查询失败：${String(rt.error)}`} onRetry={() => rtLine.trim() && rtStation.trim() && rt.mutate({ line: rtLine, station: rtStation })} />
+                {rtFail && (
+                  <ErrorBox
+                    message={rtFail}
+                    onRetry={() => {
+                      if (!rtLine.trim() || !rtStation.trim()) return;
+                      setRtFail("");
+                      rt.mutate({ line: rtLine, station: rtStation });
+                    }}
+                  />
                 )}
                 {rt.data?.ok && (
                   <RealtimePanel
@@ -966,6 +1085,7 @@ export function App() {
                   </label>
                   <div className="flex gap-2">
                     <input
+                      {...FIELDS.getLineDetail.line}
                       id="line-input"
                       className={inputCls}
                       value={lineInput}
@@ -979,8 +1099,20 @@ export function App() {
                   </div>
                 </form>
 
+                {ldFormError && (
+                  <p className="mt-3 text-sm text-[var(--danger)]">{ldFormError}</p>
+                )}
                 {ld.data && !ld.data.ok && <ErrorBox message={ld.data.error} onRetry={() => lineInput.trim() && ld.mutate(lineInput)} />}
-                {ld.isError && <ErrorBox message={`查询失败：${String(ld.error)}`} onRetry={() => lineInput.trim() && ld.mutate(lineInput)} />}
+                {ldFail && (
+                  <ErrorBox
+                    message={ldFail}
+                    onRetry={() => {
+                      if (!lineInput.trim()) return;
+                      setLdFail("");
+                      ld.mutate(lineInput);
+                    }}
+                  />
+                )}
                 {ld.data?.ok && (
                   <LineDetailPanel
                     data={ld.data}
@@ -1009,6 +1141,7 @@ export function App() {
                   </label>
                   <div className="flex gap-2">
                     <input
+                      {...FIELDS.searchStations.keyword}
                       id="station-input"
                       className={inputCls}
                       value={stationInput}
@@ -1022,6 +1155,9 @@ export function App() {
                   </div>
                 </form>
 
+                {ssFormError && (
+                  <p className="mt-3 text-sm text-[var(--danger)]">{ssFormError}</p>
+                )}
                 {ss.data && !ss.data.ok && <ErrorBox message={ss.data.error} />}
                 {ss.data?.ok && ss.data.stations.length === 0 && (
                   <p className="mt-4 text-sm text-[var(--dim)]">没搜到相关站点，换个关键词试试。</p>
@@ -1072,13 +1208,13 @@ export function App() {
               <div>
                 <label htmlFor="route-origin" className="mb-1 block text-sm text-[var(--dim)]">起点</label>
                 <PlaceChips places={placeList} fieldLabel="起点" onPick={(p) => setOrigin(p.address)} />
-                <input id="route-origin" className={inputCls} value={origin} onChange={(e) => setOrigin(e.target.value)} placeholder={`输入${city}的起点地名`} autoComplete="off" />
+                <input {...FIELDS.planRoute.origin} id="route-origin" className={inputCls} value={origin} onChange={(e) => setOrigin(e.target.value)} placeholder={`输入${city}的起点地名`} autoComplete="off" />
               </div>
               <div>
                 <label htmlFor="route-dest" className="mb-1 block text-sm text-[var(--dim)]">终点</label>
                 <PlaceChips places={placeList} fieldLabel="终点" onPick={(p) => setDestination(p.address)} />
                 <div className="flex gap-2">
-                  <input id="route-dest" className={inputCls} value={destination} onChange={(e) => setDestination(e.target.value)} placeholder="输入终点地名" autoComplete="off" />
+                  <input {...FIELDS.planRoute.destination} id="route-dest" className={inputCls} value={destination} onChange={(e) => setDestination(e.target.value)} placeholder="输入终点地名" autoComplete="off" />
                   <button
                     type="button"
                     aria-label="交换起点和终点"
@@ -1165,6 +1301,7 @@ export function App() {
                   </div>
                   <div className="mt-2 flex gap-2">
                     <input
+                      {...FIELDS.addFavoritePlace.name}
                       className={inputCls}
                       value={savePlaceName}
                       onChange={(e) => setSavePlaceName(e.target.value)}
@@ -1197,8 +1334,20 @@ export function App() {
               )}
             </div>
 
+            {routeFormError && (
+              <p className="mt-3 text-sm text-[var(--danger)]">{routeFormError}</p>
+            )}
             {rp.data && !rp.data.ok && <ErrorBox message={rp.data.error} onRetry={() => origin.trim() && destination.trim() && rp.mutate({ origin, destination })} />}
-            {rp.isError && <ErrorBox message={`规划失败：${String(rp.error)}`} />}
+            {rpFail && (
+              <ErrorBox
+                message={rpFail}
+                onRetry={() => {
+                  if (!origin.trim() || !destination.trim()) return;
+                  setRpFail("");
+                  rp.mutate({ origin, destination });
+                }}
+              />
+            )}
             {rp.data?.ok && (
               <RoutePlansPanel
                 data={rp.data}
@@ -1208,10 +1357,10 @@ export function App() {
                 hasActiveTrip={!!activeTrip}
                 onToCanvas={planToCanvas}
                 toCanvasPending={toCanvasMut.isPending}
-                toCanvasError={toCanvasMut.isError ? `转到画布失败：${String(toCanvasMut.error)}` : ""}
+                toCanvasError={toCanvasFail}
               />
             )}
-            {startTripMut.isError && <ErrorBox message={`开始行程失败：${String(startTripMut.error)}`} />}
+            {startTripFail && <ErrorBox message={startTripFail} />}
           </section>
         )}
 
@@ -1232,7 +1381,7 @@ export function App() {
 
             {locError && <ErrorBox message={locError} />}
             {nb.data && !nb.data.ok && <ErrorBox message={nb.data.error} onRetry={findNearby} />}
-            {nb.isError && <ErrorBox message={`搜索失败：${String(nb.error)}`} onRetry={findNearby} />}
+            {nbFail && <ErrorBox message={nbFail} onRetry={findNearby} />}
             {nb.data?.ok && nb.data.stations.length === 0 && (
               <p className="mt-4 text-sm text-[var(--dim)]">1.5 公里内没搜到公交站，换个位置再试试。</p>
             )}
@@ -1474,15 +1623,18 @@ export function App() {
           ) : activeTrip ? (
             <TripPanel
               trip={activeTrip}
-              onAdvance={() => advanceTripMut.mutate()}
+              onAdvance={() => {
+                setAdvanceFail("");
+                advanceTripMut.mutate();
+              }}
               advancing={advanceTripMut.isPending}
-              advanceError={advanceTripMut.isError ? `推进失败：${String(advanceTripMut.error)}` : ""}
+              advanceError={advanceFail}
               onEnd={() => endTripMut.mutate()}
               ending={endTripMut.isPending}
               onBack={() => setTab("home")}
               onToCanvas={tripToCanvas}
               toCanvasPending={toCanvasMut.isPending}
-              toCanvasError={toCanvasMut.isError ? `转到画布失败：${String(toCanvasMut.error)}` : ""}
+              toCanvasError={toCanvasFail}
             />
           ) : (
             <section aria-label="行程模式" className="mt-10 text-center">
@@ -1636,12 +1788,16 @@ function BoardCard({
   onOpen: () => void;
 }) {
   const isLineStation = fav.kind === "lineStation";
+  const [rtFail, setRtFail] = useState("");
+  const [saFail, setSaFail] = useState("");
   const rtM = useMutation({
     mutationFn: () =>
       api.queryLineRealtime({ line: fav.value, station: fav.label, city }),
+    onError: (e) => setRtFail(`查询失败：${e.message}`),
   });
   const saM = useMutation({
     mutationFn: () => api.queryStationArrivals({ station: fav.label, city }),
+    onError: (e) => setSaFail(`查询失败：${e.message}`),
   });
   const rtData: RealtimeResult | null =
     rtM.data?.ok ? rtM.data : (entry?.realtime ?? null);
@@ -1652,9 +1808,17 @@ function BoardCard({
   const error =
     (rtM.data && !rtM.data.ok ? rtM.data.error : "") ||
     (saM.data && !saM.data.ok ? saM.data.error : "") ||
-    (rtM.isError ? `查询失败：${String(rtM.error)}` : "") ||
-    (saM.isError ? `查询失败：${String(saM.error)}` : "");
-  const refresh = () => (isLineStation ? rtM.mutate() : saM.mutate());
+    rtFail ||
+    saFail;
+  const refresh = () => {
+    if (isLineStation) {
+      setRtFail("");
+      rtM.mutate();
+    } else {
+      setSaFail("");
+      saM.mutate();
+    }
+  };
 
   const stationRows = saData
     ? saData.directions.flatMap((d) => d.lines.map((ln) => ({ dir: d.direction, ln })))
@@ -2306,16 +2470,17 @@ function TripRealtime({
         items: [{ id: 1, kind: "lineStation", value: seg.name, label: seg.departure }],
       }),
   });
+  const [rtFail, setRtFail] = useState("");
   const rtM = useMutation({
     mutationFn: () =>
       api.queryLineRealtime({ line: seg.name, station: seg.departure, city }),
+    onError: (e) => setRtFail(`查询失败：${e.message}`),
   });
   const data: RealtimeResult | null = rtM.data?.ok
     ? rtM.data
     : (snapshot.data?.entries[0]?.realtime ?? null);
   const error =
-    (rtM.data && !rtM.data.ok ? rtM.data.error : "") ||
-    (rtM.isError ? `查询失败：${String(rtM.error)}` : "");
+    (rtM.data && !rtM.data.ok ? rtM.data.error : "") || rtFail;
   const dirs = data
     ? seg.terminal
       ? data.directions.filter((d) => d.terminal === seg.terminal).length > 0
@@ -2351,7 +2516,10 @@ function TripRealtime({
         </p>
         <button
           type="button"
-          onClick={() => rtM.mutate()}
+          onClick={() => {
+            setRtFail("");
+            rtM.mutate();
+          }}
           disabled={rtM.isPending}
           aria-label={`刷新 ${seg.name} 在 ${seg.departure} 的实时到站`}
           className="shrink-0 bg-[var(--surface)] px-3 text-sm font-medium text-[var(--text)] [border-radius:8px] disabled:opacity-50"
@@ -2779,7 +2947,7 @@ function SettingsPanel({
       setAmapInput("");
       setFeedback("已保存，立即生效。");
     },
-    onError: (e) => setFeedback(`保存失败：${String(e)}`),
+    onError: (e) => setFeedback(`保存失败：${e.message}`),
   });
 
   const clearMut = useMutation({
@@ -2794,27 +2962,23 @@ function SettingsPanel({
           : "已清除界面里存的高德 key，之后用服务器文件里的 key。",
       );
     },
-    onError: (e) => setFeedback(`清除失败：${String(e)}`),
+    onError: (e) => setFeedback(`清除失败：${e.message}`),
   });
 
   const testMut = useMutation({
     mutationFn: (args: { service: "apizero" | "amap"; key?: string }) =>
       api.testApiKey(args),
+    onSuccess: (r, args) =>
+      setTestResults((prev) => ({ ...prev, [args.service]: r })),
+    onError: (e, args) =>
+      setTestResults((prev) => ({
+        ...prev,
+        [args.service]: { ok: false, message: `测试失败：${e.message}` },
+      })),
   });
   const runTest = (service: "apizero" | "amap") => {
     const typed = service === "apizero" ? apizeroInput.trim() : amapInput.trim();
-    testMut.mutate(
-      { service, ...(typed ? { key: typed } : {}) },
-      {
-        onSuccess: (r) =>
-          setTestResults((prev) => ({ ...prev, [service]: r })),
-        onError: (e) =>
-          setTestResults((prev) => ({
-            ...prev,
-            [service]: { ok: false, message: `测试失败：${String(e)}` },
-          })),
-      },
-    );
+    testMut.mutate({ service, ...(typed ? { key: typed } : {}) });
   };
 
   const effectiveTtl = ttlSel ?? data?.cacheTtlSec ?? 90;
@@ -2852,6 +3016,9 @@ function SettingsPanel({
         新 key（留空 = 不修改）
       </label>
       <input
+        {...(service === "apizero"
+          ? FIELDS.saveSettings.apizeroKey
+          : FIELDS.saveSettings.amapKey)}
         id={`key-${service}`}
         type="password"
         className="w-full border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-base text-[var(--text)] [border-radius:8px] outline-none focus:border-[var(--accent)]"
@@ -3023,8 +3190,10 @@ function SettingsPanel({
 // ---------- 到站画布 ----------
 // 把到站卡片当工作流模块摆在可平移/缩放的自由画布上，一个个加、
 // 拖动摆放、连线表达路线关系。模块与连线存服务端、按城市隔离。
-// 实时口径与站牌一致：打开先读服务端缓存快照（零接口调用），每张
-// 到站卡各自刷新（走 queryLineRealtime、吃缓存），不自动轮询。
+// 实时口径与站牌一致：打开先读服务端缓存快照（零接口调用），不做
+// 自动定时轮询——到站卡点「开始」只立即查一次，之后每张卡各自点
+// 「点查/刷新」才再查（走 queryLineRealtime、吃 90 秒服务端缓存），
+// 「停止」待机不查询。
 // 手势分工：拖模块本体移动模块，拖空白处平移画布，双指/滚轮缩放。
 
 const CANVAS_WORLD_W = 2400;
@@ -3830,10 +3999,14 @@ function CanvasView({
   const [addOpen, setAddOpen] = useState(false);
   const [addKind, setAddKind] = useState<"station" | "text">("station");
   const [lineKw, setLineKw] = useState("");
+  const [lineKwError, setLineKwError] = useState("");
   const [dirIdx, setDirIdx] = useState(0);
   const [textVal, setTextVal] = useState("");
+  const [textFormError, setTextFormError] = useState("");
+  const [ldFail, setLdFail] = useState("");
   const ldMut = useMutation({
     mutationFn: (line: string) => api.getLineDetail({ line, city }),
+    onError: (e) => setLdFail(`查线路失败：${e.message}`),
   });
   const centerWorldPos = () => {
     const rect = containerRef.current?.getBoundingClientRect();
@@ -3876,8 +4049,11 @@ function CanvasView({
   const closeAdd = () => {
     setAddOpen(false);
     setLineKw("");
+    setLineKwError("");
     setTextVal("");
+    setTextFormError("");
     setDirIdx(0);
+    setLdFail("");
     ldMut.reset();
   };
   const addStationModule = (station: string) => {
@@ -3897,7 +4073,11 @@ function CanvasView({
   };
   const addTextModule = () => {
     const t = textVal.trim();
-    if (!t) return;
+    if (!t) {
+      setTextFormError("先写点文字再加到画布。");
+      return;
+    }
+    setTextFormError("");
     const pos = centerWorldPos();
     addModuleMut.mutate({ kind: "text", text: t, ...pos });
     closeAdd();
@@ -4451,16 +4631,21 @@ function CanvasView({
               onSubmit={(e) => {
                 e.preventDefault();
                 const n = projectNameInput.trim();
-                if (n) createProjectMut.mutate(n);
+                if (!n) {
+                  setProjectError("项目名不能为空，先起个名再建。");
+                  return;
+                }
+                setProjectError("");
+                createProjectMut.mutate(n);
               }}
             >
               <input
+                {...FIELDS.createCanvasProject.name}
                 className={inputCls}
                 value={projectNameInput}
                 onChange={(e) => setProjectNameInput(e.target.value)}
                 placeholder="给新项目起个名，如：上班、下班、去同安"
                 aria-label="新项目名称"
-                maxLength={30}
                 autoComplete="off"
               />
               <button
@@ -4478,18 +4663,23 @@ function CanvasView({
               onSubmit={(e) => {
                 e.preventDefault();
                 const n = projectNameInput.trim();
-                if (n && curProjectId > 0) {
+                if (!n) {
+                  setProjectError("新名不能为空。");
+                  return;
+                }
+                setProjectError("");
+                if (curProjectId > 0) {
                   renameProjectMut.mutate({ id: curProjectId, name: n });
                 }
               }}
             >
               <input
+                {...FIELDS.renameCanvasProject.name}
                 className={inputCls}
                 value={projectNameInput}
                 onChange={(e) => setProjectNameInput(e.target.value)}
                 placeholder="新的项目名，如：上班"
                 aria-label="当前项目的新名称"
-                maxLength={30}
                 autoComplete="off"
               />
               <button
@@ -4585,38 +4775,49 @@ function CanvasView({
           </button>
 
           {addKind === "text" ? (
-            <form
-              className="mt-3 flex gap-2"
-              onSubmit={(e) => {
-                e.preventDefault();
-                addTextModule();
-              }}
-            >
-              <input
-                className={inputCls}
-                value={textVal}
-                onChange={(e) => setTextVal(e.target.value)}
-                placeholder="写个目的地或备注，如：马厝"
-                aria-label="文本卡内容"
-                autoComplete="off"
-              />
-              <button type="submit" className={submitCls} disabled={!textVal.trim() || addModuleMut.isPending}>
-                加到画布
-              </button>
-            </form>
+            <div className="mt-3">
+              <form
+                className="flex gap-2"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  addTextModule();
+                }}
+              >
+                <input
+                  {...FIELDS.addCanvasModule.text}
+                  className={inputCls}
+                  value={textVal}
+                  onChange={(e) => setTextVal(e.target.value)}
+                  placeholder="写个目的地或备注，如：马厝"
+                  aria-label="文本卡内容"
+                  autoComplete="off"
+                />
+                <button type="submit" className={submitCls} disabled={!textVal.trim() || addModuleMut.isPending}>
+                  加到画布
+                </button>
+              </form>
+              {textFormError && (
+                <p className="mt-2 text-sm text-[var(--danger)]">{textFormError}</p>
+              )}
+            </div>
           ) : (
             <div className="mt-3">
               <form
                 className="flex gap-2"
                 onSubmit={(e) => {
                   e.preventDefault();
-                  if (lineKw.trim()) {
-                    setDirIdx(0);
-                    ldMut.mutate(lineKw);
+                  if (!lineKw.trim()) {
+                    setLineKwError("先输入线路号再查线路。");
+                    return;
                   }
+                  setLineKwError("");
+                  setLdFail("");
+                  setDirIdx(0);
+                  ldMut.mutate(lineKw);
                 }}
               >
                 <input
+                  {...FIELDS.getLineDetail.line}
                   className={inputCls}
                   value={lineKw}
                   onChange={(e) => setLineKw(e.target.value)}
@@ -4628,6 +4829,9 @@ function CanvasView({
                   {ldMut.isPending ? "查线路…" : "查线路"}
                 </button>
               </form>
+              {lineKwError && (
+                <p className="mt-2 text-sm text-[var(--danger)]">{lineKwError}</p>
+              )}
               {ldMut.data && !ldMut.data.ok && (
                 <div className="mt-2">
                   <p className="text-sm text-[var(--danger)]">{ldMut.data.error}</p>
@@ -4642,9 +4846,9 @@ function CanvasView({
                   </button>
                 </div>
               )}
-              {ldMut.isError && (
+              {ldFail && (
                 <div className="mt-2">
-                  <p className="text-sm text-[var(--danger)]">查线路失败：{String(ldMut.error)}</p>
+                  <p className="text-sm text-[var(--danger)]">{ldFail}</p>
                   <button
                     type="button"
                     onClick={addBlankStationModule}
@@ -5183,7 +5387,7 @@ function CanvasView({
           操作说明（点开看）
         </summary>
         <p className="pb-1 text-xs leading-relaxed text-[var(--dim)]">
-          两种看法：自由画布自由拖动摆布，拖模块本体移动它（点中或拖动的模块会自动翻到最前），拖空白处平移画布，双指或滚轮缩放；纵向流是路线树，像二叉树一样分叉：顶层卡自上而下是主线（卡间向下的大箭头是「然后」），一张卡下面缩进挂着的子卡是它分出的不同路线，同父的子卡之间标「或」任选其一，子卡下面还能再挂子卡、继续往下分。带子卡的卡能点「收起」把整条支线折成一行摘要，点摘要重新展开，收起状态会记住。卡面只留核心信息（站名/线路/方向/第 1 班/第 2 班/数据时间）和一行操作（开始/停止、点查、更多）；存库、删除、备注、挂接都收在卡片的「更多」里，点开才显示，一次只开一张。挂接：在「更多」里点「挂到某张卡后面」再点选一张卡，这张卡就成为它的子卡（分支路线）；「移到顶层」解除挂接回到主线；不能挂到自己或自己的子卡下面（会绕成圈）。续接新卡不用挂接：在某张卡的「更多」顶部点「＋ 在后面加一张」，新卡直接生在它下面接着往下；点「＋ 加并列方案」，新卡和它同层并列、中间是「或」。加的都是空白到站卡，落下后点选站名线路即可。「＋ 加模块」新放的卡默认在顶层主线。自由画布里每张卡左上角有步号徽章（旧的步骤编号，同一步多卡标方案A/B/C）。连线（自由画布）：按住模块右侧的蓝点拖到另一个模块上松手（虚线带箭头）；整删在卡片「更多」里点「删除」（会先确认一次；删掉一张卡，它的子卡会自动改挂到它的上一级）。到站卡可开始/停止：停止后变灰待机、不查车。打开画布不自动查车：有缓存先看缓存，每张到站卡点刷新只查它自己。到站卡前三行（站名/线路/方向）点一下先出可选项点选——方向行点 ◀ ▶ 直接在两个终点站之间切换、点方向文字出终点站二选一，站名从站序里挑、线路从你用过的里面挑，实在没有选项才打字，选完自动保存；「＋ 加模块」里可以直接放一张空白卡，不用先查线路。配好的模块点卡片「更多」里的「存库」存入模块库，之后在「＋ 加模块 → 我的模块库」点一下就放一份副本到画布上，副本和模板互不影响。页头点项目名可以切换项目，「⋯」菜单里新建、改名、删除项目。项目里的模块、连线、位置改完即存，切走再回来原样恢复。
+          两种看法：自由画布自由拖动摆布，拖模块本体移动它（点中或拖动的模块会自动翻到最前），拖空白处平移画布，双指或滚轮缩放；纵向流是路线树，像二叉树一样分叉：顶层卡自上而下是主线（卡间向下的大箭头是「然后」），一张卡下面缩进挂着的子卡是它分出的不同路线，同父的子卡之间标「或」任选其一，子卡下面还能再挂子卡、继续往下分。带子卡的卡能点「收起」把整条支线折成一行摘要，点摘要重新展开，收起状态会记住。卡面只留核心信息（站名/线路/方向/第 1 班/第 2 班/数据时间）和一行操作（开始/停止、点查、更多）；存库、删除、备注、挂接都收在卡片的「更多」里，点开才显示，一次只开一张。挂接：在「更多」里点「挂到某张卡后面」再点选一张卡，这张卡就成为它的子卡（分支路线）；「移到顶层」解除挂接回到主线；不能挂到自己或自己的子卡下面（会绕成圈）。续接新卡不用挂接：在某张卡的「更多」顶部点「＋ 在后面加一张」，新卡直接生在它下面接着往下；点「＋ 加并列方案」，新卡和它同层并列、中间是「或」。加的都是空白到站卡，落下后点选站名线路即可。「＋ 加模块」新放的卡默认在顶层主线。自由画布里每张卡左上角有步号徽章（旧的步骤编号，同一步多卡标方案A/B/C）。连线（自由画布）：按住模块右侧的蓝点拖到另一个模块上松手（虚线带箭头）；整删在卡片「更多」里点「删除」（会先确认一次；删掉一张卡，它的子卡会自动改挂到它的上一级）。到站卡可开始/停止：停止后变灰待机、不查车；点「开始」只当场查一次，之后不自动刷新，想看最新就点卡上的「点查/刷新」再查（走 90 秒缓存）。打开画布不自动查车：有缓存先看缓存。到站卡前三行（站名/线路/方向）点一下先出可选项点选——方向行点 ◀ ▶ 直接在两个终点站之间切换、点方向文字出终点站二选一，站名从站序里挑、线路从你用过的里面挑，实在没有选项才打字，选完自动保存；「＋ 加模块」里可以直接放一张空白卡，不用先查线路。配好的模块点卡片「更多」里的「存库」存入模块库，之后在「＋ 加模块 → 我的模块库」点一下就放一份副本到画布上，副本和模板互不影响。页头点项目名可以切换项目，「⋯」菜单里新建、改名、删除项目。项目里的模块、连线、位置改完即存，切走再回来原样恢复。
         </p>
       </details>
     </section>
@@ -5278,9 +5482,11 @@ function CanvasStationCard({
   flowTools?: ReactNode;
 }) {
   const stopped = !mod.enabled;
+  const [rtFail, setRtFail] = useState("");
   const rtM = useMutation({
     mutationFn: () =>
       api.queryLineRealtime({ line: mod.line, station: mod.station, city }),
+    onError: (e) => setRtFail(`查询失败：${e.message}`),
   });
   const data: RealtimeResult | null = stopped
     ? null
@@ -5300,8 +5506,7 @@ function CanvasStationCard({
       : null);
   const error = stopped
     ? ""
-    : (rtM.data && !rtM.data.ok ? rtM.data.error : "") ||
-      (rtM.isError ? `查询失败：${String(rtM.error)}` : "");
+    : (rtM.data && !rtM.data.ok ? rtM.data.error : "") || rtFail;
   // 前三行就地编辑：点一行进入编辑，失焦/回车保存、Esc 取消，改完即存
   const [editField, setEditField] = useState<"station" | "line" | "terminal" | null>(null);
   const [draft, setDraft] = useState("");
@@ -5321,6 +5526,11 @@ function CanvasStationCard({
   };
   const editInput = (label: string) => (
     <input
+      {...(editField === "line"
+        ? FIELDS.updateCanvasModule.line
+        : editField === "station"
+          ? FIELDS.updateCanvasModule.station
+          : FIELDS.updateCanvasModule.terminal)}
       autoFocus
       value={draft}
       onChange={(e) => setDraft(e.target.value)}
@@ -5661,7 +5871,7 @@ function CanvasStationCard({
 
       {stopped ? (
         <p className="mt-1.5 text-sm text-[var(--dim)]">
-          已停止 · 待机中，不查车。点下面「开始」恢复。
+          已停止 · 待机中，不查车。点下面「开始」只查一次，之后点「点查」才再更新。
         </p>
       ) : (
         <>
@@ -5723,14 +5933,29 @@ function CanvasStationCard({
       )}
 
       {/* 常驻操作行（一行三个，约 40px 高）：开始/停止、点查、更多。
-          存库/删除/备注/挂接都在「更多」展开区里，卡面不再摊开 */}
+          存库/删除/备注/挂接都在「更多」展开区里，卡面不再摊开。
+          实时口径：不做自动定时轮询——点「开始」只立即查一次，之后
+          只有点「点查/刷新」才再查（继续走服务端 90 秒缓存）；「停止」
+          回到待机、不查询。 */}
       <div className="mt-2 flex items-center gap-1.5">
         <button
           type="button"
-          onClick={() => onToggleEnabled(stopped)}
+          onClick={() => {
+            if (stopped) {
+              // 开始：恢复启用，并立即查一次；之后不再自动刷新
+              onToggleEnabled(true);
+              if (mod.line && mod.station) {
+                setRtFail("");
+                rtM.mutate();
+              }
+            } else {
+              // 停止：只回待机，不发起任何查询
+              onToggleEnabled(false);
+            }
+          }}
           aria-label={
             stopped
-              ? `开始 ${mod.line} 在 ${mod.station} 的模块`
+              ? `开始 ${mod.line} 在 ${mod.station} 的模块（开始时查一次）`
               : `停止 ${mod.line} 在 ${mod.station} 的模块`
           }
           aria-pressed={!stopped}
@@ -5744,7 +5969,10 @@ function CanvasStationCard({
         </button>
         <button
           type="button"
-          onClick={() => rtM.mutate()}
+          onClick={() => {
+            setRtFail("");
+            rtM.mutate();
+          }}
           disabled={stopped || rtM.isPending || !mod.line || !mod.station}
           aria-label={`刷新 ${mod.line} 在 ${mod.station} 的实时到站`}
           className="min-h-10 flex-1 bg-[var(--accent)] px-2.5 text-base font-bold whitespace-nowrap text-[var(--accent-ink)] [border-radius:8px] disabled:opacity-40"
@@ -5780,6 +6008,7 @@ function CanvasStationCard({
           />
           {flowTools}
           <input
+            {...FIELDS.updateCanvasModule.note}
             defaultValue={mod.note}
             key={`${mod.id}:${mod.note}`}
             onBlur={(e) => {
@@ -5824,6 +6053,7 @@ function CanvasTextCard({
   return (
     <div>
       <textarea
+        {...FIELDS.updateCanvasModule.text}
         defaultValue={mod.text}
         key={`${mod.id}:${mod.text}`}
         rows={2}
