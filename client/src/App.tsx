@@ -1,4 +1,5 @@
 import {
+  useCallback,
   useEffect,
   useRef,
   useState,
@@ -3396,10 +3397,10 @@ function CanvasView({
   const modules = canvasQ.data?.modules ?? [];
   const links = canvasQ.data?.links ?? [];
 
-  // 显示模式：自由画布（free）/ 纵向流（flow）。选择按「城市+项目」
-  // 记在 localStorage；没记过的项目，窄屏（<640px）默认纵向流、
-  // 宽屏默认自由画布。
-  const [canvasMode, setCanvasMode] = useState<"free" | "flow">("flow");
+  // 显示模式：自由画布（free）/ 纵向流（flow）/ 文字版（text）。
+  // 选择按「城市+项目」记在 localStorage；没记过的项目，窄屏
+  // （<640px）默认纵向流、宽屏默认自由画布。
+  const [canvasMode, setCanvasMode] = useState<"free" | "flow" | "text">("flow");
   const modeProjectRef = useRef(0);
   useEffect(() => {
     if (!curProjectId || modeProjectRef.current === curProjectId) return;
@@ -3410,10 +3411,10 @@ function CanvasView({
     } catch {
       v = null;
     }
-    if (v === "free" || v === "flow") setCanvasMode(v);
+    if (v === "free" || v === "flow" || v === "text") setCanvasMode(v);
     else setCanvasMode(window.innerWidth < 640 ? "flow" : "free");
   }, [curProjectId, city]);
-  const switchMode = (m: "free" | "flow") => {
+  const switchMode = (m: "free" | "flow" | "text") => {
     setCanvasMode(m);
     try {
       window.localStorage.setItem(`canvas-mode:${city}:${curProjectId}`, m);
@@ -3523,6 +3524,28 @@ function CanvasView({
     enabled: stationMods.length > 0,
   });
   const entryOf = (id: number) => snapshot.data?.entries.find((e) => e.id === id);
+
+  // 到站卡当前显示的实时状态（卡片自己点查到的数据与报错，就是卡面
+  // 此刻呈现的那一份）按模块 id 同步到这里：文字版模式直接读这份
+  // 状态渲染，两边永远是同一份数据、文字版没有自己的副本。卡片还
+  // 没挂载过（直接以文字版打开画布）时，文字版退回上面的缓存快照
+  // entry——那正是卡片首屏用的同一份。文字版自身不发起任何查询，
+  // 数据新鲜度仍由卡片的开始 / 点查驱动。
+  const [rtReports, setRtReports] = useState<
+    ReadonlyMap<number, { data: RealtimeResult | null; error: string }>
+  >(new Map());
+  const reportRt = useCallback(
+    (id: number, data: RealtimeResult | null, error: string) => {
+      setRtReports((prev) => {
+        const cur = prev.get(id);
+        if (cur && cur.data === data && cur.error === error) return prev;
+        const next = new Map(prev);
+        next.set(id, { data, error });
+        return next;
+      });
+    },
+    [],
+  );
 
   const applyCanvas = (data: CanvasData) => {
     queryClient.setQueryData(["canvas", city, data.projectId], data);
@@ -4193,6 +4216,7 @@ function CanvasView({
             onToggleMore={toggleMore}
             onDeleteRequest={() => setConfirmDeleteId(m.id)}
             flowTools={tools}
+            onRtReport={reportRt}
           />
         ) : (
           <CanvasTextCard
@@ -4450,6 +4474,179 @@ function CanvasView({
     );
   };
 
+  // ---- 文字版渲染：与纵向流同一棵路线树（canvasTree）、同一次序，
+  // 平铺成纯文字。子卡相对父卡用树形符号缩进（├─ / └─，续行用 │
+  // 对齐），同父并列子卡之间一行「或」；顶层之间是主线先后，用 ↓
+  // 分隔（与纵向流的向下箭头同义）。每张到站卡呈现站名、线路、
+  // 开往方向与第 1 / 第 2 班；实时状态读 rtReports 里卡片同步来的
+  // 当前显示状态（点查结果、暂无车、报错都如实带过来），卡片还没
+  // 挂载过时退回缓存快照 entry，与卡片首屏同源。文字版不看折叠
+  // 状态（整棵树全展开，方便一眼看全），自身不发起任何查询 ----
+  const renderTextNode = (
+    node: CanvasTreeNode,
+    prefix: string,
+    isChild: boolean,
+    isLast: boolean,
+  ): ReactNode => {
+    const m = node.mod;
+    const kids = node.children;
+    const branch = isChild ? (isLast ? "└─ " : "├─ ") : "";
+    const cont = prefix + (isChild ? (isLast ? "   " : "│  ") : "");
+    let title: ReactNode;
+    const details: ReactNode[] = [];
+    if (m.kind === "text") {
+      title = (
+        <span className="font-bold text-[var(--text)]">
+          {m.text.trim() || "（未填的文本卡）"}
+        </span>
+      );
+      if (m.note.trim()) {
+        details.push(
+          <span key="note" className="text-[var(--dim)]">
+            {m.note.trim()}
+          </span>,
+        );
+      }
+    } else {
+      // 与卡片完全同口径地选方向：先按方向号、再按终点站名，方向
+      // 未定时优先有车的方向
+      const rep = rtReports.get(m.id);
+      const data: RealtimeResult | null = !m.enabled
+        ? null
+        : rep
+          ? rep.data
+          : (entryOf(m.id)?.realtime ?? null);
+      const rtError = !m.enabled ? "" : rep ? rep.error : "";
+      const dirUnset = m.direction === 0 && !m.terminal;
+      const dir =
+        data?.directions.find((d) => d.direction === m.direction) ??
+        data?.directions.find((d) => d.terminal === m.terminal) ??
+        (dirUnset
+          ? (data?.directions.find((d) => d.buses.length > 0) ??
+            data?.directions[0] ??
+            null)
+          : null);
+      const terminalText = m.terminal || dir?.terminal || "";
+      title = (
+        <>
+          <span className="font-bold text-[var(--text)]">
+            {m.station.trim() || "未填站名"}
+          </span>
+          {m.line.trim() && (
+            <span className="font-bold text-[var(--accent)]">
+              {" · "}
+              {m.line.trim()}
+            </span>
+          )}
+        </>
+      );
+      details.push(
+        <span key="dir" className="text-[var(--dim)]">
+          {terminalText ? `开往 ${terminalText}` : "方向未填"}
+        </span>,
+      );
+      if (!m.enabled) {
+        details.push(
+          <span key="stopped" className="text-[var(--dim)]">
+            已停止 · 待机中，不查车
+          </span>,
+        );
+      } else {
+        if (rtError) {
+          details.push(
+            <span key="err" className="text-[var(--danger)]">
+              {rtError}
+            </span>,
+          );
+        }
+        if (!data && !rtError) {
+          details.push(
+            <span key="none" className="text-[var(--dim)]">
+              {m.line.trim() && m.station.trim()
+                ? "未查询"
+                : "站名和线路还没填好"}
+            </span>,
+          );
+        }
+        if (data && !dir && !rtError) {
+          details.push(
+            <span key="nodir" className="text-[var(--dim)]">
+              这个方向暂时没有查到数据
+            </span>,
+          );
+        }
+        if (data && dir) {
+          if (dir.error) {
+            details.push(
+              <span key="derr" className="text-[var(--danger)]">
+                这个方向查询失败
+              </span>,
+            );
+          } else {
+            for (const idx of [0, 1]) {
+              const b = dir.buses[idx];
+              details.push(
+                <span key={`bus${idx}`} className="text-[var(--text)]">
+                  <span className="text-[var(--dim)]">第 {idx + 1} 班 </span>
+                  {b
+                    ? `${boardHeadline(b)}${b.arrivalTime ? ` · ${b.arrivalTime}到` : ""}`
+                    : idx === 0
+                      ? "暂无车"
+                      : "暂无"}
+                </span>,
+              );
+            }
+            details.push(
+              <span key="time" className="text-xs text-[var(--dim)]">
+                数据时间 {data.queriedAt}
+                {data.cached ? " · 缓存" : ""}
+              </span>,
+            );
+          }
+        }
+      }
+      if (m.note.trim()) {
+        details.push(
+          <span key="note" className="text-[var(--dim)]">
+            备注：{m.note.trim()}
+          </span>,
+        );
+      }
+    }
+    return (
+      <div key={m.id}>
+        <p className="text-base whitespace-pre-wrap">
+          <span className="text-[var(--dim)]" aria-hidden="true">
+            {prefix}
+            {branch}
+          </span>
+          {title}
+        </p>
+        {details.map((d, i) => (
+          <p key={i} className="whitespace-pre-wrap">
+            <span className="text-[var(--dim)]" aria-hidden="true">
+              {cont}
+            </span>
+            {d}
+          </p>
+        ))}
+        {kids.map((child, ci) => (
+          <div key={child.mod.id}>
+            {ci > 0 && (
+              <p
+                className="font-bold whitespace-pre-wrap text-[var(--amber)]"
+                aria-hidden="true"
+              >
+                {cont}或
+              </p>
+            )}
+            {renderTextNode(child, cont, true, ci === kids.length - 1)}
+          </div>
+        ))}
+      </div>
+    );
+  };
+
   return (
     <section
       aria-label="到站画布"
@@ -4498,8 +4695,8 @@ function CanvasView({
             </span>
           </button>
         )}
-        {/* 显示模式切换：自由画布 / 纵向流，按城市+项目记住选择；
-            模式说明已移入下方「操作说明」折叠区，这里不再占位 */}
+        {/* 显示模式切换：自由画布 / 纵向流 / 文字版，按城市+项目记住
+            选择；模式说明已移入下方「操作说明」折叠区，这里不再占位 */}
         <div
           className="flex shrink-0 overflow-hidden border border-[var(--border)] [border-radius:8px]"
           role="group"
@@ -4528,6 +4725,18 @@ function CanvasView({
             }`}
           >
             纵向流
+          </button>
+          <button
+            type="button"
+            onClick={() => switchMode("text")}
+            aria-pressed={canvasMode === "text"}
+            className={`min-h-10 px-3 text-sm ${
+              canvasMode === "text"
+                ? "bg-[var(--accent)] font-bold text-[var(--accent-ink)]"
+                : "bg-[var(--surface)] font-medium text-[var(--dim)]"
+            }`}
+          >
+            文字版
           </button>
         </div>
         <span className="min-w-0 flex-1" />
@@ -5317,6 +5526,7 @@ function CanvasView({
                         setMoreCardId(moreCardId === m.id ? null : m.id)
                       }
                       onDeleteRequest={() => setConfirmDeleteId(m.id)}
+                      onRtReport={reportRt}
                     />
                   ) : (
                     <CanvasTextCard
@@ -5382,12 +5592,46 @@ function CanvasView({
         </div>
       )}
 
+      {canvasQ.data && canvasMode === "text" && (
+        <div
+          className="mt-2 min-h-0 flex-1 overflow-y-auto"
+          aria-label={`${city}到站画布文字版：与纵向流同一棵路线树的纯文字版，内容与卡片当前状态同步`}
+        >
+          {templateFlash && (
+            <p className="mb-2 px-1 text-sm font-medium text-[var(--accent)]" role="status">
+              {templateFlash}
+            </p>
+          )}
+          {modules.length === 0 ? (
+            <p className="px-2 py-10 text-center text-base leading-relaxed text-[var(--dim)]">
+              还没有模块。点上面「＋ 加模块」放一张空白到站卡，或从模块库调用、从规划转进来，第一张卡就会出现在这里。
+            </p>
+          ) : (
+            <div className="border border-[var(--border)] bg-[var(--surface)] px-4 py-3 text-sm leading-7 [border-radius:var(--radius)]">
+              {canvasTree.map((node, i) => (
+                <div key={node.mod.id}>
+                  {i > 0 && (
+                    <p
+                      className="font-black text-[var(--accent)]"
+                      aria-hidden="true"
+                    >
+                      ↓
+                    </p>
+                  )}
+                  {renderTextNode(node, "", false, true)}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
       <details className="mt-1.5 shrink-0">
         <summary className="min-h-8 cursor-pointer text-sm text-[var(--dim)]">
           操作说明（点开看）
         </summary>
         <p className="pb-1 text-xs leading-relaxed text-[var(--dim)]">
-          两种看法：自由画布自由拖动摆布，拖模块本体移动它（点中或拖动的模块会自动翻到最前），拖空白处平移画布，双指或滚轮缩放；纵向流是路线树，像二叉树一样分叉：顶层卡自上而下是主线（卡间向下的大箭头是「然后」），一张卡下面缩进挂着的子卡是它分出的不同路线，同父的子卡之间标「或」任选其一，子卡下面还能再挂子卡、继续往下分。带子卡的卡能点「收起」把整条支线折成一行摘要，点摘要重新展开，收起状态会记住。卡面只留核心信息（站名/线路/方向/第 1 班/第 2 班/数据时间）和一行操作（开始/停止、点查、更多）；存库、删除、备注、挂接都收在卡片的「更多」里，点开才显示，一次只开一张。挂接：在「更多」里点「挂到某张卡后面」再点选一张卡，这张卡就成为它的子卡（分支路线）；「移到顶层」解除挂接回到主线；不能挂到自己或自己的子卡下面（会绕成圈）。续接新卡不用挂接：在某张卡的「更多」顶部点「＋ 在后面加一张」，新卡直接生在它下面接着往下；点「＋ 加并列方案」，新卡和它同层并列、中间是「或」。加的都是空白到站卡，落下后点选站名线路即可。「＋ 加模块」新放的卡默认在顶层主线。自由画布里每张卡左上角有步号徽章（旧的步骤编号，同一步多卡标方案A/B/C）。连线（自由画布）：按住模块右侧的蓝点拖到另一个模块上松手（虚线带箭头）；整删在卡片「更多」里点「删除」（会先确认一次；删掉一张卡，它的子卡会自动改挂到它的上一级）。到站卡可开始/停止：停止后变灰待机、不查车；点「开始」只当场查一次，之后不自动刷新，想看最新就点卡上的「点查/刷新」再查（走 90 秒缓存）。打开画布不自动查车：有缓存先看缓存。到站卡前三行（站名/线路/方向）点一下先出可选项点选——方向行点 ◀ ▶ 直接在两个终点站之间切换、点方向文字出终点站二选一，站名从站序里挑、线路从你用过的里面挑，实在没有选项才打字，选完自动保存；「＋ 加模块」里可以直接放一张空白卡，不用先查线路。配好的模块点卡片「更多」里的「存库」存入模块库，之后在「＋ 加模块 → 我的模块库」点一下就放一份副本到画布上，副本和模板互不影响。页头点项目名可以切换项目，「⋯」菜单里新建、改名、删除项目。项目里的模块、连线、位置改完即存，切走再回来原样恢复。
+          三种看法：自由画布自由拖动摆布，拖模块本体移动它（点中或拖动的模块会自动翻到最前），拖空白处平移画布，双指或滚轮缩放；纵向流是路线树，像二叉树一样分叉：顶层卡自上而下是主线（卡间向下的大箭头是「然后」），一张卡下面缩进挂着的子卡是它分出的不同路线，同父的子卡之间标「或」任选其一，子卡下面还能再挂子卡、继续往下分。文字版把同一棵路线树写成纯文字：每张卡一行站名、线路、开往方向和第 1 班 / 第 2 班，子卡缩进并用树形符号相连、同父子卡之间标「或」，整棵树全展开；它和卡片共用同一份数据——在卡片上开始 / 点查后切过来，看到的就是卡片此刻的最新结果（暂无车、报错也一样），文字版自己不查车，想更新先回卡片点查。带子卡的卡能点「收起」把整条支线折成一行摘要，点摘要重新展开，收起状态会记住。卡面只留核心信息（站名/线路/方向/第 1 班/第 2 班/数据时间）和一行操作（开始/停止、点查、更多）；存库、删除、备注、挂接都收在卡片的「更多」里，点开才显示，一次只开一张。挂接：在「更多」里点「挂到某张卡后面」再点选一张卡，这张卡就成为它的子卡（分支路线）；「移到顶层」解除挂接回到主线；不能挂到自己或自己的子卡下面（会绕成圈）。续接新卡不用挂接：在某张卡的「更多」顶部点「＋ 在后面加一张」，新卡直接生在它下面接着往下；点「＋ 加并列方案」，新卡和它同层并列、中间是「或」。加的都是空白到站卡，落下后点选站名线路即可。「＋ 加模块」新放的卡默认在顶层主线。自由画布里每张卡左上角有步号徽章（旧的步骤编号，同一步多卡标方案A/B/C）。连线（自由画布）：按住模块右侧的蓝点拖到另一个模块上松手（虚线带箭头）；整删在卡片「更多」里点「删除」（会先确认一次；删掉一张卡，它的子卡会自动改挂到它的上一级）。到站卡可开始/停止：停止后变灰待机、不查车；点「开始」只当场查一次，之后不自动刷新，想看最新就点卡上的「点查/刷新」再查（走 90 秒缓存）。打开画布不自动查车：有缓存先看缓存。到站卡前三行（站名/线路/方向）点一下先出可选项点选——方向行点 ◀ ▶ 直接在两个终点站之间切换、点方向文字出终点站二选一，站名从站序里挑、线路从你用过的里面挑，实在没有选项才打字，选完自动保存；「＋ 加模块」里可以直接放一张空白卡，不用先查线路。配好的模块点卡片「更多」里的「存库」存入模块库，之后在「＋ 加模块 → 我的模块库」点一下就放一份副本到画布上，副本和模板互不影响。页头点项目名可以切换项目，「⋯」菜单里新建、改名、删除项目。项目里的模块、连线、位置改完即存，切走再回来原样恢复。
         </p>
       </details>
     </section>
@@ -5462,10 +5706,18 @@ function CanvasStationCard({
   onToggleMore,
   onDeleteRequest,
   flowTools,
+  onRtReport,
 }: {
   mod: CanvasModule;
   city: string;
   entry: BoardEntry | undefined;
+  // 把本卡当前显示的实时状态（数据/报错）同步给画布层：文字版模式
+  // 按这份状态渲染，保证文字版与卡片永远同一份数据
+  onRtReport?: (
+    id: number,
+    data: RealtimeResult | null,
+    error: string,
+  ) => void;
   onStartLink?: () => void;
   onSaveTemplate: () => void;
   saveTemplatePending: boolean;
@@ -5507,6 +5759,11 @@ function CanvasStationCard({
   const error = stopped
     ? ""
     : (rtM.data && !rtM.data.ok ? rtM.data.error : "") || rtFail;
+  // 当前显示状态（点查结果/缓存快照/报错）同步给画布层：切到文字版
+  // 时按这份状态重新渲染，暂无车、报错都如实带过去，不另存副本
+  useEffect(() => {
+    onRtReport?.(mod.id, data, error);
+  }, [onRtReport, mod.id, data, error]);
   // 前三行就地编辑：点一行进入编辑，失焦/回车保存、Esc 取消，改完即存
   const [editField, setEditField] = useState<"station" | "line" | "terminal" | null>(null);
   const [draft, setDraft] = useState("");
