@@ -21,13 +21,47 @@ import { api, type ApiResponse } from "./api";
 // 不会各说一套；每个喂给受限字段的输入都展开对应的 FIELDS 条目。
 const FIELDS = actionFields<typeof Actions>();
 
+// 公交数据接口报错的人话翻译（与服务端同一套口径，客户端再兜一
+// 层）：原始程序错误文本（SyntaxError、JSON Parse error、
+// Unrecognized token、TypeError、fetch failed 等）永远不直接
+// 显示——非 JSON / 对方服务器故障翻成「暂时不可用」，超时 /
+// 连不上翻成「连接失败」；接口正常返回的业务错误（如额度用完）
+// 与其他中文人话原样保留。
+const BUS_UNAVAILABLE =
+  "公交数据接口暂时不可用（对方服务器故障），请稍后再试";
+const BUS_CONN_FAILED = "公交数据接口连接失败，请稍后再试";
+function humanBusError(raw: string): string {
+  const msg = (raw ?? "").trim();
+  if (!msg) return msg;
+  if (msg.includes("暂时不可用（对方服务器故障）")) return BUS_UNAVAILABLE;
+  if (msg.includes("公交数据接口连接失败")) return BUS_CONN_FAILED;
+  if (
+    /SyntaxError|JSON Parse|Unrecognized token|Unexpected token|Unexpected end|not valid JSON/i.test(
+      msg,
+    )
+  ) {
+    return BUS_UNAVAILABLE;
+  }
+  if (
+    /fetch failed|TypeError|TimeoutError|AbortError|timed?\s?out|NetworkError|Failed to fetch|ENOTFOUND|ECONNREFUSED|ECONNRESET|ETIMEDOUT|socket/i.test(
+      msg,
+    )
+  ) {
+    return BUS_CONN_FAILED;
+  }
+  if (/^(ReferenceError|RangeError|EvalError|URIError|Error)\s*:/.test(msg)) {
+    return BUS_CONN_FAILED;
+  }
+  return msg;
+}
+
 // 保存失败的底部提示用中文措辞：服务端自己给的报错原文已是中文、直接
 // 用；请求字段校验失败（英文默认消息）换成一句中文提示。
 setFailureNoticeText((error, message) => {
   if (error instanceof SpaceActionError && error.issues.length > 0) {
     return "填写的内容不符合要求，请检查后再试一次。";
   }
-  return message;
+  return humanBusError(message);
 });
 
 // ---------- types derived from actions ----------
@@ -1064,9 +1098,9 @@ export function App() {
                   <p className="mt-3 text-sm text-[var(--danger)]">{rtFormError}</p>
                 )}
                 {rt.data && !rt.data.ok && (
-                  <ErrorBox message={rt.data.error} onRetry={retryRt} />
+                  <ErrorBox message={humanBusError(rt.data.error)} onRetry={retryRt} />
                 )}
-                {rtFail && <ErrorBox message={rtFail} onRetry={retryRt} />}
+                {rtFail && <ErrorBox message={humanBusError(rtFail)} onRetry={retryRt} />}
                 {rt.data?.ok && (
                   <RealtimePanel
                     data={rt.data}
@@ -1112,8 +1146,8 @@ export function App() {
                 {ldFormError && (
                   <p className="mt-3 text-sm text-[var(--danger)]">{ldFormError}</p>
                 )}
-                {ld.data && !ld.data.ok && <ErrorBox message={ld.data.error} onRetry={retryLd} />}
-                {ldFail && <ErrorBox message={ldFail} onRetry={retryLd} />}
+                {ld.data && !ld.data.ok && <ErrorBox message={humanBusError(ld.data.error)} onRetry={retryLd} />}
+                {ldFail && <ErrorBox message={humanBusError(ldFail)} onRetry={retryLd} />}
                 {ld.data?.ok && (
                   <LineDetailPanel
                     data={ld.data}
@@ -1159,7 +1193,7 @@ export function App() {
                 {ssFormError && (
                   <p className="mt-3 text-sm text-[var(--danger)]">{ssFormError}</p>
                 )}
-                {ss.data && !ss.data.ok && <ErrorBox message={ss.data.error} />}
+                {ss.data && !ss.data.ok && <ErrorBox message={humanBusError(ss.data.error)} />}
                 {ss.data?.ok && ss.data.stations.length === 0 && (
                   <p className="mt-4 text-sm text-[var(--dim)]">没搜到相关站点，换个关键词试试。</p>
                 )}
@@ -1185,7 +1219,7 @@ export function App() {
                 )}
 
                 {sa.isPending && <p className="mt-6 text-sm text-[var(--dim)]">正在查「{saStation}」的实时到站…</p>}
-                {sa.data && !sa.data.ok && <ErrorBox message={sa.data.error} onRetry={() => saStation && sa.mutate({ station: saStation })} />}
+                {sa.data && !sa.data.ok && <ErrorBox message={humanBusError(sa.data.error)} onRetry={() => saStation && sa.mutate({ station: saStation })} />}
                 {sa.data?.ok && (
                   <StationArrivalsPanel
                     data={sa.data}
@@ -1806,11 +1840,12 @@ function BoardCard({
     saM.data?.ok ? saM.data : (entry?.arrivals ?? null);
   const loaded = isLineStation ? rtData : saData;
   const pending = rtM.isPending || saM.isPending;
-  const error =
+  const error = humanBusError(
     (rtM.data && !rtM.data.ok ? rtM.data.error : "") ||
-    (saM.data && !saM.data.ok ? saM.data.error : "") ||
-    rtFail ||
-    saFail;
+      (saM.data && !saM.data.ok ? saM.data.error : "") ||
+      rtFail ||
+      saFail,
+  );
   const refresh = () => {
     if (isLineStation) {
       setRtFail("");
@@ -2048,7 +2083,7 @@ function RealtimePanel({
                   .join(" · ")}
               </p>
               {d.error ? (
-                <p className="mt-3 text-sm text-[var(--danger)]">这个方向查询失败：{d.error}</p>
+                <p className="mt-3 text-sm text-[var(--danger)]">这个方向查询失败：{humanBusError(d.error)}</p>
               ) : !nextBus ? (
                 <p className="mt-3 text-sm text-[var(--dim)]">暂无车辆信息（可能尚未发车或已收班）</p>
               ) : (
@@ -2186,7 +2221,7 @@ function StationArrivalsPanel({
           <section key={d.direction} aria-label={`方向 ${d.direction === 1 ? "一" : "二"}`}>
             <SectionTitle>{`方向 ${d.direction === 1 ? "一" : "二"}`}</SectionTitle>
             {d.error ? (
-              <p className="mt-2 text-sm text-[var(--danger)]">查询失败：{d.error}</p>
+              <p className="mt-2 text-sm text-[var(--danger)]">查询失败：{humanBusError(d.error)}</p>
             ) : d.lines.length === 0 ? (
               <p className="mt-2 text-sm text-[var(--dim)]">这个方向暂无线路数据</p>
             ) : (
@@ -2480,8 +2515,9 @@ function TripRealtime({
   const data: RealtimeResult | null = rtM.data?.ok
     ? rtM.data
     : (snapshot.data?.entries[0]?.realtime ?? null);
-  const error =
-    (rtM.data && !rtM.data.ok ? rtM.data.error : "") || rtFail;
+  const error = humanBusError(
+    (rtM.data && !rtM.data.ok ? rtM.data.error : "") || rtFail,
+  );
   const dirs = data
     ? seg.terminal
       ? data.directions.filter((d) => d.terminal === seg.terminal).length > 0
@@ -3575,12 +3611,14 @@ function CanvasView({
           city,
         });
         if (res.ok) reportRt(m.id, res, "");
-        else reportRt(m.id, null, res.error);
+        else reportRt(m.id, null, humanBusError(res.error));
       } catch (e) {
         reportRt(
           m.id,
           null,
-          `查询失败：${e instanceof Error ? e.message : String(e)}`,
+          humanBusError(
+            `查询失败：${e instanceof Error ? e.message : String(e)}`,
+          ),
         );
       }
       done += 1;
@@ -4573,7 +4611,8 @@ function CanvasView({
           : rep
             ? rep.data
             : (entryOf(m.id)?.realtime ?? null);
-      const rtError = !m.enabled && !hasFresh ? "" : rep ? rep.error : "";
+      const rtError =
+        !m.enabled && !hasFresh ? "" : rep ? humanBusError(rep.error) : "";
       const dirUnset = m.direction === 0 && !m.terminal;
       const dir =
         data?.directions.find((d) => d.direction === m.direction) ??
@@ -5100,7 +5139,7 @@ function CanvasView({
               )}
               {ldMut.data && !ldMut.data.ok && (
                 <div className="mt-2">
-                  <p className="text-sm text-[var(--danger)]">{ldMut.data.error}</p>
+                  <p className="text-sm text-[var(--danger)]">{humanBusError(ldMut.data.error)}</p>
                   <button
                     type="button"
                     onClick={addBlankStationModule}
@@ -5114,7 +5153,7 @@ function CanvasView({
               )}
               {ldFail && (
                 <div className="mt-2">
-                  <p className="text-sm text-[var(--danger)]">{ldFail}</p>
+                  <p className="text-sm text-[var(--danger)]">{humanBusError(ldFail)}</p>
                   <button
                     type="button"
                     onClick={addBlankStationModule}
@@ -5840,7 +5879,9 @@ function CanvasStationCard({
       : null);
   const error = stopped
     ? ""
-    : (rtM.data && !rtM.data.ok ? rtM.data.error : "") || rtFail;
+    : humanBusError(
+        (rtM.data && !rtM.data.ok ? rtM.data.error : "") || rtFail,
+      );
   // 当前显示状态（点查结果/缓存快照/报错）同步给画布层：切到文字版
   // 时按这份状态重新渲染，暂无车、报错都如实带过去，不另存副本
   useEffect(() => {

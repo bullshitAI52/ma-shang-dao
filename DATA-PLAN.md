@@ -194,6 +194,12 @@
 - **树形文字**: 与纵向流共用 canvasTree 与同一次序，整棵树全展开（不看折叠状态，方便一眼看全）；子卡标题行带 ├─ / └─、续行用 │ 对齐缩进，同父并列子卡之间一行琥珀「或」，顶层之间以 ↓ 分隔（主线先后，与纵向流箭头同义）；文本卡呈现其文字与备注，到站卡备注以「备注：」附后；行距 leading-7，配色走现有主题变量
 - **口径不变**: 纯客户端展示改动——不新增服务端动作、不新增任何公交接口调用、不自动轮询；数据新鲜度仍只由卡片「开始 / 点查」驱动；自由画布、纵向流、项目、挂接、模块库等其他功能一律不动
 
+### 报错人话翻译（2026-11-20 二十轮）
+- **起因**: 2026-11-20 早上 apizero 服务器 502 宕机，返回 nginx 的 HTML 网页而非 JSON，privileged 层直接 `res.json()` 解析把「SyntaxError: JSON Parse error: Unrecognized token '<'」原文拼进报错，显示在到站画布卡片（文字版每张卡的错误行同源同步）上，用户看不懂
+- **三层翻译**: ①privileged `apizeroCall` 改为先 `res.text()` 再解析——HTTP 5xx 或正文非 JSON → 「公交数据接口暂时不可用（对方服务器故障），请稍后再试」；fetch 本身失败（超时 AbortSignal.timeout / 网络连不上）→ 「公交数据接口连接失败，请稍后再试」，原始错误文本不再拼进任何返回。②actions 层 `humanizeBusError`/`busErrMsg` 兜底：`apizero()` 对 privileged 返回的 error 与自身 JSON.parse 失败统一过翻译，实时类动作（getLineDetail、queryLineRealtime 含逐方向、searchStations、queryStationArrivals 含逐方向、testApiKey 的 apizero 分支）的 catch 改走 busErrMsg。③客户端 `humanBusError` 再兜一层：查车页实时/线路/站点 ErrorBox、各方向错误行、收藏站牌卡、行程当前段实时、画布卡片、文字版错误行与「全部刷新」、底部失败提示，显示前都过翻译
+- **业务错误不翻译**: apizero 正常返回 JSON 且 code 非 0（如 4030「今日免费额度已用完」）仍走原有「公交数据接口错误 <code>：<中文提示>」原文显示；缺密钥提示同样保留
+- **口径不变**: 失败结果仍不进 90 秒缓存（queryLineRealtime/queryStationArrivals 原有「全部方向都失败不缓存」逻辑未动）、开始/停止与点查状态语义不变、不新增自动轮询、不改布局与其他文案；高德侧仅顺带把 fetch 失败/解析失败的原始错误收成中文句，业务 info 原文不变
+
 ## Long-term data behavior
 - **Refresh policy**: 无定时刷新、无自动轮询；所有实时数据只在用户主动查询/点刷新时向 API 拉取（apizero 按次计费）
 - **额度保护缓存（2026-11-18 加）**: 服务端内存缓存——实时到站（线路+站名关键词）与站点到站（站名）结果缓存 90 秒，90 秒内重复查询直接返回缓存并标「缓存」，不调 apizero；客户端另有「强制刷新」按钮绕过缓存真调接口。线路站点序单独长缓存 12 小时，仅用于推导方向「下一站」，不额外烧额度（查线路详情时顺带填充；站点视图只读该缓存、有才标下一站）

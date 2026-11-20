@@ -127,6 +127,57 @@ function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
+// ---------- 公交数据接口错误翻译（人话） ----------
+// 界面上永远不出现原始程序错误文本（SyntaxError、JSON Parse
+// error、Unrecognized token、TypeError、fetch failed、英文堆栈
+// 等）。privileged 层已按故障类型翻好，这里再兜一层：万一任何
+// 一条路径漏出原始错误，进 UI 前统一翻译——非 JSON / 对方服务
+// 器故障 → 「暂时不可用」；超时 / 连不上 → 「连接失败」。
+// apizero 正常返回的业务错误（「公交数据接口错误 <code>：<中文
+// 提示>」，如 4030 今日免费额度已用完）与缺密钥提示是人话，
+// 原样保留、不翻译。
+const BUS_UNAVAILABLE =
+  "公交数据接口暂时不可用（对方服务器故障），请稍后再试";
+const BUS_CONN_FAILED = "公交数据接口连接失败，请稍后再试";
+
+function humanizeBusError(raw: string): string {
+  const msg = (raw ?? "").trim();
+  if (!msg) return BUS_CONN_FAILED;
+  if (msg.includes("暂时不可用（对方服务器故障）")) return BUS_UNAVAILABLE;
+  if (msg.includes("公交数据接口连接失败")) return BUS_CONN_FAILED;
+  if (msg.startsWith("公交数据接口错误")) return msg;
+  if (msg.includes("还没有设置公交数据密钥")) return msg;
+  // 旧格式「公交数据接口请求失败：<原始错误>」：剥掉前缀按原文再判
+  if (msg.startsWith("公交数据接口请求失败")) {
+    const rest = msg.replace(/^公交数据接口请求失败[：:]?\s*/, "");
+    if (!rest || rest === msg) return BUS_CONN_FAILED;
+    return humanizeBusError(rest);
+  }
+  if (
+    /SyntaxError|JSON Parse|Unrecognized token|Unexpected token|Unexpected end|not valid JSON|无法解析/i.test(
+      msg,
+    )
+  ) {
+    return BUS_UNAVAILABLE;
+  }
+  if (
+    /fetch failed|TypeError|TimeoutError|AbortError|timed?\s?out|NetworkError|Failed to fetch|ENOTFOUND|ECONNREFUSED|ECONNRESET|ETIMEDOUT|socket/i.test(
+      msg,
+    )
+  ) {
+    return BUS_CONN_FAILED;
+  }
+  // 其他带原始错误类名前缀的英文程序错误一律不外露
+  if (/^(ReferenceError|RangeError|EvalError|URIError|Error)\s*:/.test(msg)) {
+    return BUS_CONN_FAILED;
+  }
+  return msg;
+}
+
+function busErrMsg(e: unknown): string {
+  return humanizeBusError(errMsg(e));
+}
+
 // 北京时间（Asia/Shanghai）「H:MM」：小时不补零，如「7:20」。服务端
 // 运行环境时区不一定是北京，凡是时刻显示一律显式按 Asia/Shanghai 换算，
 // 不用运行环境的本地时区。
@@ -180,8 +231,13 @@ async function apizero(
     paramsJson: JSON.stringify(params),
     keyOverride: await uiApizeroKey(ctx),
   });
-  if (!r.ok) throw new Error(r.error || "公交数据接口请求失败");
-  const parsed: unknown = JSON.parse(r.body || "{}");
+  if (!r.ok) throw new Error(humanizeBusError(r.error || ""));
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(r.body || "{}");
+  } catch {
+    throw new Error(BUS_UNAVAILABLE);
+  }
   return rec(parsed);
 }
 
@@ -195,8 +251,13 @@ async function amap(
     paramsJson: JSON.stringify(params),
     keyOverride: await uiAmapKey(ctx),
   });
-  if (!r.ok) throw new Error(r.error || "高德地图接口请求失败");
-  const parsed: unknown = JSON.parse(r.body || "{}");
+  if (!r.ok) throw new Error(r.error || "高德地图接口请求失败，请稍后再试");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(r.body || "{}");
+  } catch {
+    throw new Error("高德地图接口返回了无法解析的内容，请稍后再试");
+  }
   return rec(parsed);
 }
 
@@ -1794,7 +1855,7 @@ export const Actions = {
             : [d1];
         return { ok: true, error: "", line, directions };
       } catch (e) {
-        return { ok: false, error: errMsg(e), line, directions: [] };
+        return { ok: false, error: busErrMsg(e), line, directions: [] };
       }
     },
   }),
@@ -1853,7 +1914,7 @@ export const Actions = {
               firstTime: "",
               lastTime: "",
               price: "",
-              error: errMsg(e),
+              error: busErrMsg(e),
               buses: [],
             });
           }
@@ -1883,7 +1944,7 @@ export const Actions = {
         });
         return result;
       } catch (e) {
-        return { ...empty, error: errMsg(e) };
+        return { ...empty, error: busErrMsg(e) };
       }
     },
   }),
@@ -1911,7 +1972,7 @@ export const Actions = {
           .filter((s) => s.name !== "");
         return { ok: true, error: "", stations };
       } catch (e) {
-        return { ok: false, error: errMsg(e), stations: [] };
+        return { ok: false, error: busErrMsg(e), stations: [] };
       }
     },
   }),
@@ -1977,7 +2038,7 @@ export const Actions = {
             }
             directions.push({ direction, error: "", lines });
           } catch (e) {
-            directions.push({ direction, error: errMsg(e), lines: [] });
+            directions.push({ direction, error: busErrMsg(e), lines: [] });
           }
         }
         const result: z.infer<typeof stationArrivalsResponse> = {
@@ -2002,7 +2063,7 @@ export const Actions = {
         }
         return result;
       } catch (e) {
-        return { ok: false, error: errMsg(e), ...base };
+        return { ok: false, error: busErrMsg(e), ...base };
       }
     },
   }),
@@ -3878,7 +3939,8 @@ export const Actions = {
           }),
           keyOverride,
         });
-        if (!r.ok) return { ok: false, message: r.error || "接口请求失败" };
+        if (!r.ok)
+          return { ok: false, message: humanizeBusError(r.error || "") };
         let count = 0;
         try {
           count = arr(rec(JSON.parse(r.body || "{}")).stations).length;

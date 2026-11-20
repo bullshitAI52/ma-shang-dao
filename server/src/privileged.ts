@@ -55,6 +55,14 @@ export const privileged = definePrivilegedContracts({
   },
 });
 
+// apizero 故障时给用户看的人话：原始程序错误（SyntaxError、
+// TypeError、fetch failed 等）一律不外露。非 JSON / 5xx 是对方
+// 服务器故障；超时 / 连不上是连接失败；接口正常返回的业务错误
+// （code 非 0）不在这里翻译，仍用其原有中文提示。
+const APIZERO_UNAVAILABLE =
+  "公交数据接口暂时不可用（对方服务器故障），请稍后再试";
+const APIZERO_CONN_FAILED = "公交数据接口连接失败，请稍后再试";
+
 function readKeyFile(name: string): string {
   const p = join(homedir(), name);
   if (existsSync(p)) return readFileSync(p, "utf8").trim();
@@ -89,11 +97,18 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
         body: args.paramsJson,
         signal: AbortSignal.timeout(20000),
       });
-      const data = (await res.json()) as {
-        code?: number;
-        msg?: string;
-        data?: unknown;
-      };
+      // 先拿原文再解析：对方宕机时返回的是 nginx 的 HTML 网页
+      // （如 502），直接 res.json() 会把 SyntaxError 原文抛出去。
+      const text = await res.text();
+      if (res.status >= 500) {
+        return { ok: false, body: "", error: APIZERO_UNAVAILABLE };
+      }
+      let data: { code?: number; msg?: string; data?: unknown };
+      try {
+        data = JSON.parse(text || "{}") as typeof data;
+      } catch {
+        return { ok: false, body: "", error: APIZERO_UNAVAILABLE };
+      }
       if (data.code !== 0) {
         return {
           ok: false,
@@ -102,8 +117,10 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
         };
       }
       return { ok: true, body: JSON.stringify(data.data ?? {}), error: "" };
-    } catch (e) {
-      return { ok: false, body: "", error: `公交数据接口请求失败：${String(e)}` };
+    } catch {
+      // fetch 本身失败：超时（AbortSignal.timeout）或网络连不上，
+      // 原始错误文本不外露，统一翻成连接失败。
+      return { ok: false, body: "", error: APIZERO_CONN_FAILED };
     }
   },
 
@@ -125,8 +142,8 @@ export const privilegedHandlers = definePrivilegedHandlers(privileged, {
       });
       const text = await res.text();
       return { ok: true, body: text, error: "" };
-    } catch (e) {
-      return { ok: false, body: "", error: `高德地图接口请求失败：${String(e)}` };
+    } catch {
+      return { ok: false, body: "", error: "高德地图接口请求失败，请稍后再试" };
     }
   },
 });
